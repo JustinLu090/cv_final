@@ -120,9 +120,137 @@ For each scene, the following videos are generated:
 3. **depth_regression.mp4** - Absolute depth predictions vs ground truth (if trained)
 4. **trajectory.mp4** - Camera trajectory prediction vs ground truth
 
+---
 
+## Occlusion Experiment: Object Permanence Test
 
-##  Model Architecture
+This experiment demonstrates TempoVLM's **"memory"** capability - the ability to remember scene content during temporary occlusions.
+
+### Concept
+
+```
+Normal frame:                 Occluded frame:
+┌─────────────────┐          ┌─────────────────┐
+│ ╔═══╗ ╔═══╗    │          │                 │
+│ ║   ║ ║   ║    │    →     │   ██████████    │
+│ ╠═══╬═╬═══╣    │          │   ██ BLACK ██   │
+│ ║   ║ ║   ║    │          │   ██████████    │
+│ ╚═══╝ ╚═══╝    │          │                 │
+└─────────────────┘          └─────────────────┘
+  (wooden lattice)              (center blocked)
+```
+
+**Question**: Can the model "remember" what's behind the black box?
+
+### Method: Direct Feature Injection
+
+We inject TempoVLM's temporally-enhanced features back into Qwen2-VL's vision encoder to make the "memory" visible in language output.
+
+```
+Standard VLM (Base Model):
+┌──────────┐    ┌─────────────────┐    ┌──────────────┐    ┌─────┐
+│ Occluded │ →  │ Vision Encoder  │ →  │ Features     │ →  │ LLM │ → "black square"
+│ Image    │    └─────────────────┘    │ (corrupted)  │    └─────┘
+└──────────┘                           └──────────────┘
+
+Direct Feature Injection:
+┌──────────┐    ┌─────────────────┐    ┌──────────────┐
+│ Occluded │ →  │ Vision Encoder  │ →   │ Original     │─┐
+│ Image    │    └─────────────────┘    │ Features     │ │
+└──────────┘                           └──────────────┘ │
+                                                        ├→ Fusion → LLM → "wooden lattice"
+┌──────────────────────────────────┐                    │
+│ TempoVLM Enhanced Features       │────────────────────┘
+│ (contains memory of prev frames) │
+└──────────────────────────────────┘
+```
+
+### Injection Formula
+
+```python
+# Interpolate method (safest)
+modified_features = (1 - α) × original_features + α × memory_features
+
+# Where α = 0.1 (10% memory injection is usually sufficient)
+```
+
+### Run Occlusion Test
+
+```bash
+python test_occlusion.py \
+    --model_path ./checkpoints/best_unified_model.pt \
+    --data_root ./scannet_data \
+    --output_dir ./occlusion_results \
+    --split test \
+    --num_scenes 3 \
+    --occlusion_type box \
+    --occlusion_ratio 0.5
+```
+
+### Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model_path` | Required | Path to trained UnifiedTempoVLM |
+| `--data_root` | `./scannet_data` | Path to ScanNet data |
+| `--output_dir` | `./occlusion_results` | Output directory |
+| `--split` | `test` | Dataset split (train/test) |
+| `--num_scenes` | `3` | Number of scenes to test |
+| `--occlusion_type` | `box` | Occlusion type: `box`, `noise` |
+| `--occlusion_ratio` | `0.5` | Ratio of image to occlude (0-1) |
+
+### Output Files
+
+```
+occlusion_results/
+├── scene_xxx/
+│   ├── occlusion_test.mp4      # Video with similarity curves
+│   ├── results.json            # Detailed metrics
+│   ├── similarity_plot.png     # Feature similarity over time
+│   └── report.md               # Markdown report
+└── summary.json                # Cross-scene summary
+```
+
+### Example Results
+
+```json
+{
+  "frame_idx": 15,
+  "is_occluded": true,
+  "memory_test": {
+    "base_model": {
+      "text_response": "There is a black square in the center of the image.",
+      "feature_similarity_to_pre_occlusion": 0.758
+    },
+    "unified_model": {
+      "text_response": "There is a black square in the center of the image.",
+      "feature_similarity_to_pre_occlusion": 0.935
+    },
+    "direct_injection": {
+      "text_response": "The image shows a wooden structure with a lattice design. The lattice is made up of horizontal and vertical wooden slats...",
+      "method": "interpolate_0.1"
+    },
+    "ground_truth": "wooden structure... lattice-like pattern... horizontal and vertical wooden beams..."
+  }
+}
+```
+
+### Key Findings
+
+| Model | Can See Through Occlusion? | Feature Memory Score |
+|-------|---------------------------|---------------------|
+| Base Model | "black square" | 0.758 |
+| TempoVLM (feature only) |  Same text output | **0.935** (+0.177) |
+| Direct Injection |  **"wooden lattice"** | - |
+
+**Conclusion**: 
+- TempoVLM maintains **+17.7%** higher feature similarity during occlusion
+- Direct Feature Injection successfully translates this memory into language output
+- The model can "see through" the occlusion and describe what was there before
+
+---
+
+## Model Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
