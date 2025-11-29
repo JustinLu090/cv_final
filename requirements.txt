@@ -1,0 +1,29 @@
+# Python 依賴套件
+# TempoVLM-3R Temporal Adapter Training
+
+# 核心框架
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.37.0
+
+# Qwen2-VL 相關
+qwen-vl-utils
+accelerate>=0.26.0
+
+# 影像處理
+pillow>=9.0.0
+opencv-python>=4.8.0
+
+# 進度條與工具
+tqdm>=4.65.0
+numpy>=1.24.0
+
+# 資料處理
+scipy>=1.10.0
+
+# 訓練監控
+tensorboard>=2.14.0
+matplotlib>=3.7.0
+
+# 其他工具
+pyyaml>=6.0
