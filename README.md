@@ -131,11 +131,11 @@ This experiment demonstrates TempoVLM's **"memory"** capability - the ability to
 ```
 Normal frame:                 Occluded frame:
 ┌─────────────────┐          ┌─────────────────┐
-│ ╔═══╗ ╔═══╗    │          │                 │
-│ ║   ║ ║   ║    │    →     │   ██████████    │
-│ ╠═══╬═╬═══╣    │          │   ██ BLACK ██   │
-│ ║   ║ ║   ║    │          │   ██████████    │
-│ ╚═══╝ ╚═══╝    │          │                 │
+│ ╔═══╗ ╔═══╗     │          │                 │
+│ ║   ║ ║   ║     │    →     │   ██████████    │
+│ ╠═══╬═╬═══╣     │          │   ██ BLACK ██   │
+│ ║   ║ ║   ║     │          │   ██████████    │
+│ ╚═══╝ ╚═══╝     │          │                 │
 └─────────────────┘          └─────────────────┘
   (wooden lattice)              (center blocked)
 ```
@@ -155,7 +155,7 @@ Standard VLM (Base Model):
 
 Direct Feature Injection:
 ┌──────────┐    ┌─────────────────┐    ┌──────────────┐
-│ Occluded │ →  │ Vision Encoder  │ →   │ Original     │─┐
+│ Occluded │ →  │ Vision Encoder  │ →  │ Original     │─┐
 │ Image    │    └─────────────────┘    │ Features     │ │
 └──────────┘                           └──────────────┘ │
                                                         ├→ Fusion → LLM → "wooden lattice"
