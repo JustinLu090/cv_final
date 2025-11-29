@@ -390,12 +390,12 @@ def get_model_info(model: UnifiedTempoVLM) -> Dict:
 
 
 # ============================================================
-# 測試
+# Testing
 # ============================================================
 
 if __name__ == "__main__":
-    print("測試 UnifiedTempoVLM...")
-    
+    print("Testing UnifiedTempoVLM...")
+
     model = UnifiedTempoVLM(feat_dim=1536, hidden_dim=768)
     model.eval()
     
@@ -405,7 +405,7 @@ if __name__ == "__main__":
     region_a = torch.randn(batch_size, 1536)
     region_b = torch.randn(batch_size, 1536)
     
-    print("\n測試多任務前向傳播...")
+    print("\nTesting multi-task forward propagation...")
     outputs = model(
         curr_feat=curr_feat,
         prev_feat=prev_feat,
@@ -418,8 +418,8 @@ if __name__ == "__main__":
     print(f"  depth_order output: {outputs['depth_order'].shape}")
     print(f"  motion output: {outputs['motion'].shape}")
     print(f"  scene_class output: {outputs['scene_class'].shape}")
-    
-    print("\n測試損失計算...")
+
+    print("\nTesting loss calculation...")
     loss_fn = UnifiedLoss()
     targets = {
         'depth_order': torch.randint(0, 2, (batch_size,)),
@@ -431,12 +431,12 @@ if __name__ == "__main__":
     print(f"  Total loss: {total_loss.item():.4f}")
     for k, v in loss_dict.items():
         print(f"  {k} loss: {v:.4f}")
-    
-    print("\n模型資訊:")
+
+    print("\nModel Information:")
     info = get_model_info(model)
-    print(f"  總參數: {info['total_params']:,}")
-    print(f"  各分支參數:")
+    print(f"  Total Parameters: {info['total_params']:,}")
+    print(f"  Branch Parameters:")
     for branch, params in info['branch_params'].items():
         print(f"    {branch}: {params:,}")
-    
-    print("\n✅ 測試完成！")
+
+    print("\n✅ Testing completed!")
