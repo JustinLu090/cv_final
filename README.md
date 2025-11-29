@@ -41,7 +41,7 @@ Install Qwen2-VL utilities:
 pip install qwen-vl-utils
 ```
 
-## 📊 Dataset
+## Dataset
 
 This project uses [ScanNet]dataset. Organize your data as:
 
@@ -98,7 +98,7 @@ python train_unified.py \
 | `--resume` | `None` | Checkpoint to resume from |
 | `--save_every` | `2` | Save checkpoint every N epochs |
 
-## 🎬 Visualization Demo
+## Visualization Demo
 
 Generate visualization videos for trained model:
 
