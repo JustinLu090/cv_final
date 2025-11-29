@@ -134,17 +134,17 @@ For each scene, the following videos are generated:
 │  │ Shared Encoder  │  1536 → 768                            │
 │  └────────┬────────┘                                        │
 │           │                                                 │
-│  ┌────────┴────────┬──────────────┬──────────────┐         │
-│  │                 │              │              │         │
-│  ▼                 ▼              ▼              ▼         │
-│ Temporal       Depth Order   Depth Regress   Motion       │
-│ Branch         Branch        Branch          Branch       │
-│ (768→1536)     (768*2→2)     (768→1)         (768*2→6)   │
+│  ┌────────┴────────┬──────────────┬──────────────┐          │
+│  │                 │              │              │          │
+│  ▼                 ▼              ▼              ▼          │
+│ Temporal       Depth Order   Depth Regress   Motion         │
+│ Branch         Branch        Branch          Branch         │
+│ (768→1536)     (768*2→2)     (768→1)         (768*2→6)      │
 │                                                             │
-│ Output:        Output:       Output:         Output:       │
-│ Enhanced       A/B closer    Depth (m)       6-DoF        │
-│ Features       probability   0.5~5.0m        tx,ty,tz,    │
-│                                              rx,ry,rz     │
+│ Output:        Output:       Output:         Output:        │
+│ Enhanced       A/B closer    Depth (m)       6-DoF          │
+│ Features       probability   0.5~5.0m        tx,ty,tz,      │
+│                                              rx,ry,rz       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
