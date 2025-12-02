@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and Checkpoints (too large for git)
+datasets/
+scannet_data/
+checkpoints/
+checkpoints_*/
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Output directories (generated files)
+logs/
+demo_output/
+complete_demo_output/
+occlusion_results/
+occlusion_test/
+occlusion_test_v2/
+occlusion_injection_test/
+eval_test/
+trajectory_eval/
+viz_demo/
+viz_output/
+viz_depth_regression/
+adapter_demo/
+
+# Temporary files
+*.log
+*.tmp
+*.cache
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
