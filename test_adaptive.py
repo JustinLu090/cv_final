@@ -29,8 +29,8 @@ import json
 from PIL import Image
 from datetime import datetime
 
-from occlusion_tester import OcclusionTester
-from memory_utils import AdaptiveMemoryBuffer
+from utils.occlusion_tester import OcclusionTester
+from utils.memory_utils import AdaptiveMemoryBuffer
 
 
 class Logger:

@@ -39,7 +39,7 @@ from datetime import datetime
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-from memory_utils import AdaptiveMemoryBuffer
+from utils.memory_utils import AdaptiveMemoryBuffer
 
 
 class CompleteDemoVisualizer:
