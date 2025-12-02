@@ -1,4 +1,4 @@
-# Python 依賴套件
+
 # TempoVLM-3R Temporal Adapter Training
 
 # 核心框架
