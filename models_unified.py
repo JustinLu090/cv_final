@@ -12,13 +12,17 @@ class UnifiedTempoVLM(nn.Module):
 
     Tasks:
     - temporal: 時序一致性 (使用 GRU 長期記憶)
-    - depth_order: 深度排序 (A vs B 誰更近)
-    - depth_regression: 相對深度值預測
+    - depth_order: 深度排序 (A vs B 誰更近) - 使用 GT 深度標籤訓練
+    - depth_regression: 相對深度值預測 - 使用 GT 深度標籤訓練
     - motion: 相機運動預測 (6DoF)
     
     GRU 記憶功能:
     - 維護長期隱藏狀態，即使連續多幀被遮擋也能保留之前的資訊
     - 自動學習何時更新/遺忘記憶
+    
+    Transformer Encoder:
+    - 使用多層 Transformer 替代簡單 Linear，提升特徵表達能力
+    - Pre-LN 架構確保訓練穩定性
     """
     
     def __init__(
@@ -28,22 +32,66 @@ class UnifiedTempoVLM(nn.Module):
         num_scene_classes: int = 20,
         dropout: float = 0.1,
         use_gru_memory: bool = True,  # 是否使用 GRU 記憶
+        use_transformer_encoder: bool = True,  # 是否使用 Transformer Encoder
+        num_encoder_layers: int = 2,  # Transformer 層數
+        num_heads: int = 8,  # Attention head 數量
     ):
         super().__init__()
         
         self.feat_dim = feat_dim
         self.hidden_dim = hidden_dim
         self.use_gru_memory = use_gru_memory
+        self.use_transformer_encoder = use_transformer_encoder
         
         # ============================================================
-        # shared encoder
+        # shared encoder (Transformer 或 簡單 MLP)
         # ============================================================
-        self.shared_encoder = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        if use_transformer_encoder:
+            # 使用 Transformer Encoder（更強的特徵提取）
+            self.input_proj = nn.Linear(feat_dim, hidden_dim)
+            
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,  # Pre-LN，訓練更穩定
+            )
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layer, 
+                num_layers=num_encoder_layers
+            )
+            self.encoder_norm = nn.LayerNorm(hidden_dim)
+            
+            # 為了向後兼容，創建一個 wrapper
+            def shared_encoder_forward(x):
+                # x: [B, feat_dim]
+                x = self.input_proj(x)  # [B, hidden_dim]
+                x = x.unsqueeze(1)  # [B, 1, hidden_dim] - 加 sequence 維度
+                x = self.transformer_encoder(x)  # [B, 1, hidden_dim]
+                x = x.squeeze(1)  # [B, hidden_dim]
+                return self.encoder_norm(x)
+            
+            # 包裝成 module（方便參數管理）
+            class SharedEncoderWrapper(nn.Module):
+                def __init__(self, forward_fn):
+                    super().__init__()
+                    self.forward_fn = forward_fn
+                
+                def forward(self, x):
+                    return self.forward_fn(x)
+            
+            self.shared_encoder = SharedEncoderWrapper(shared_encoder_forward)
+        else:
+            # 原始簡單 MLP（向後兼容）
+            self.shared_encoder = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
         
         # ============================================================
         # GRU Long-term Memory (NEW)
@@ -432,130 +480,151 @@ class UnifiedTempoVLM(nn.Module):
 class UnifiedLoss(nn.Module):
     """
     Unified multi-task loss for UnifiedTempoVLM
-    使用 Kendall et al. (CVPR 2018) 的自動加權方法
+    
+    重新設計的 Loss 平衡策略：
+    1. 使用固定的 loss 尺度歸一化，確保每個任務貢獻均衡
+    2. 對 InfoNCE loss 進行特殊處理（值很大）
+    3. 手動設定任務優先級權重
     """
     def __init__(
         self,
         num_tasks: int = 5,
-        use_uncertainty_weighting: bool = True,
+        use_uncertainty_weighting: bool = False,  # 預設關閉自動權重
+        # 手動權重設定（經過調校）
+        task_weights: Dict[str, float] = None,
     ):
         super().__init__()
         
         self.use_uncertainty_weighting = use_uncertainty_weighting
         
-        # 可學習的 log variance 參數 (用於自動 Loss 平衡)
-        # 任務順序: [temporal, depth_order, depth_regression, motion, scene_class]
-        if use_uncertainty_weighting:
-            self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        # ============================================================
+        # 手動設定的任務權重（經過分析調校）
+        # ============================================================
+        if task_weights is None:
+            self.task_weights = {
+                'temporal': 0.1,          # InfoNCE loss 太大，降低權重
+                'depth_order': 1.0,       # 分類任務，保持標準權重
+                'depth_regression': 3.0,  # 🔥 提高深度回歸權重
+                'motion': 2.0,            # 🔥 提高運動預測權重
+                'scene_class': 0.5,       # 輔助任務，降低權重
+                'occlusion_recon': 1.5,   # 遮擋重建
+                'memory_quality_reg': 0.5, # 記憶品質正則化
+            }
         else:
-            # 固定權重 (備用)
-            self.register_buffer('fixed_weights', torch.ones(num_tasks))
+            self.task_weights = task_weights
+        
+        # 可學習的 log variance 參數 (備用)
+        if use_uncertainty_weighting:
+            # 用更好的初始化：depth 和 motion 的初始權重更高
+            init_log_vars = torch.tensor([2.0, 0.0, -1.0, -0.5, 0.5])  # 對應權重: [0.14, 1.0, 2.7, 1.6, 0.6]
+            self.log_vars = nn.Parameter(init_log_vars)
         
         self.ce_loss = nn.CrossEntropyLoss()
         self.mse_loss = nn.MSELoss()
+        
+        # 用於 loss 尺度追蹤的 EMA
+        self.register_buffer('loss_ema', torch.ones(num_tasks))
+        self.ema_decay = 0.99
     
-    def _weighted_loss(self, loss, task_idx):
-        """
-        根據不確定性自動加權 loss
-        公式: L_weighted = L / (2 * σ²) + log(σ) = L * exp(-log_var) / 2 + log_var / 2
-        """
-        if self.use_uncertainty_weighting:
-            # Clamp log_vars 避免數值不穩定
+    def _get_weight(self, task_name: str, task_idx: int = None) -> float:
+        """獲取任務權重"""
+        if self.use_uncertainty_weighting and task_idx is not None:
             log_var = torch.clamp(self.log_vars[task_idx], min=-4, max=4)
-            precision = torch.exp(-log_var)
-            return precision * loss + 0.5 * log_var
+            return torch.exp(-log_var)
         else:
-            return loss * self.fixed_weights[task_idx]
+            return self.task_weights.get(task_name, 1.0)
     
     def scale_invariant_depth_loss(self, pred, target):
         """
-        Scale-Invariant Loss for depth prediction
-        對深度預測更穩定，不受絕對尺度影響
+        改進的深度 Loss：
+        1. Scale-Invariant Loss
+        2. L1 Loss
+        3. 梯度 Loss（鼓勵平滑）
         """
-        # 創建有效深度的 mask（排除無效的 0 值區域）
-        valid_mask = target > 0.1  # 只考慮深度 > 0.1m 的區域
+        valid_mask = target > 0.1
         
         if valid_mask.sum() == 0:
-            # 沒有有效深度，返回 0 loss
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
         
-        # 只計算有效區域
         pred_valid = pred[valid_mask].clamp(min=1e-6)
         target_valid = target[valid_mask].clamp(min=1e-6)
         
-        # 對數空間的差異
-        log_diff = torch.log(pred_valid) - torch.log(target_valid)
-        
-        # Scale-invariant loss
-        n = log_diff.numel()
-        if n == 0:
-            return torch.tensor(0.0, device=pred.device, requires_grad=True)
-            
-        si_loss = torch.sum(log_diff ** 2) / n - (torch.sum(log_diff) ** 2) / (n ** 2)
-        
-        # 加上 L1 loss 作為正則化
+        # 1. L1 Loss（主要）
         l1_loss = F.l1_loss(pred_valid, target_valid)
         
-        return si_loss + 0.5 * l1_loss
+        # 2. Scale-Invariant Loss（輔助）
+        log_diff = torch.log(pred_valid) - torch.log(target_valid)
+        n = log_diff.numel()
+        if n > 0:
+            si_loss = torch.sum(log_diff ** 2) / n - 0.5 * (torch.sum(log_diff) ** 2) / (n ** 2)
+        else:
+            si_loss = torch.tensor(0.0, device=pred.device)
+        
+        # 3. 相對誤差 Loss（鼓勵比例正確）
+        rel_loss = (torch.abs(pred_valid - target_valid) / (target_valid + 1e-6)).mean()
+        
+        return l1_loss + 0.5 * si_loss + 0.3 * rel_loss
     
     def motion_loss(self, pred, target, log_var=None):
         """
-        運動預測的 loss，分別處理平移和旋轉
-        支援不確定性加權 (Learned Uncertainty)
-        
-        Args:
-            pred: 預測運動 [B, 6]
-            target: GT 運動 [B, 6]
-            log_var: 預測的 log variance [B, 6] (可選)
+        簡化的運動 Loss：
+        - 平移用 Smooth L1
+        - 旋轉用 MSE
         """
-        # 分離平移 [tx, ty, tz] 和旋轉 [rx, ry, rz]
         pred_trans = pred[:, :3]
         pred_rot = pred[:, 3:]
         target_trans = target[:, :3]
         target_rot = target[:, 3:]
         
-        if log_var is not None:
-            # 方案：使用軟性不確定性加權（不會產生負 loss）
-            # 使用 softplus 確保 variance > 0
-            # L = |pred - target|^2 / (2 * variance) + 0.5 * log(variance)
-            # 其中 variance = softplus(log_var) + 1e-6
-            
-            # 將 log_var 轉為正的 variance
-            variance = F.softplus(log_var) + 1e-6  # [B, 6], 確保 > 0
-            
-            var_trans = variance[:, :3]
-            var_rot = variance[:, 3:]
-            
-            # 平移 loss（誤差 / variance + log(variance)）
-            trans_error = (pred_trans - target_trans) ** 2
-            trans_loss = (trans_error / (2 * var_trans)).mean() + 0.5 * torch.log(var_trans).mean()
-            
-            # 旋轉 loss
-            rot_error = (pred_rot - target_rot) ** 2
-            rot_loss = (rot_error / (2 * var_rot)).mean() + 0.5 * torch.log(var_rot).mean()
-            
-            # 加一個 baseline loss 確保有梯度
-            baseline_trans = F.smooth_l1_loss(pred_trans, target_trans)
-            baseline_rot = F.mse_loss(pred_rot, target_rot)
-            
-            # 混合：50% 不確定性加權 + 50% baseline
-            trans_loss = 0.5 * trans_loss + 0.5 * baseline_trans
-            rot_loss = 0.5 * rot_loss + 0.5 * baseline_rot
-            
-        else:
-            # 原始 loss
-            trans_loss = F.smooth_l1_loss(pred_trans, target_trans)
-            rot_loss = F.mse_loss(pred_rot, target_rot)
+        # 簡單直接的 loss，不用不確定性
+        trans_loss = F.smooth_l1_loss(pred_trans, target_trans)
+        rot_loss = F.mse_loss(pred_rot, target_rot)
         
-        # 加入速度一致性正則化
-        # 鼓勵相鄰預測的變化平滑
-        if pred.shape[0] > 1:
-            velocity_diff = pred[1:] - pred[:-1]
-            smoothness_loss = 0.01 * (velocity_diff ** 2).mean()
-        else:
-            smoothness_loss = 0
+        return trans_loss + rot_loss
+    
+    def temporal_contrastive_loss(self, refined_curr, prev_feat):
+        """
+        改進的時序對比 Loss：
+        1. 使用更高的溫度參數（避免 loss 過大）
+        2. 加入正樣本相似度約束
+        """
+        batch_size = refined_curr.shape[0]
         
-        return trans_loss + rot_loss + smoothness_loss
+        if batch_size <= 1:
+            return 1 - F.cosine_similarity(refined_curr.float(), prev_feat.float(), dim=-1).mean(), {}, {}
+        
+        # 正則化特徵
+        refined_norm = F.normalize(refined_curr, p=2, dim=-1)
+        prev_norm = F.normalize(prev_feat, p=2, dim=-1)
+        
+        # 計算相似度矩陣
+        sim_matrix = refined_norm @ prev_norm.T
+        
+        # 🔥 使用更高的溫度，避免 loss 過大
+        tau = 0.1  # 從 0.02 提高到 0.1
+        
+        # InfoNCE Loss
+        exp_sim = torch.exp(sim_matrix / tau)
+        pos_exp = torch.diag(exp_sim)
+        
+        mask = torch.eye(batch_size, device=sim_matrix.device).bool()
+        neg_exp_sum = exp_sim.masked_fill(mask, 0).sum(dim=1)
+        
+        infonce_loss = -torch.log(pos_exp / (pos_exp + neg_exp_sum + 1e-8)).mean()
+        
+        # 🔥 加入正樣本相似度約束：鼓勵正樣本相似度 > 0.8
+        pos_sim = torch.diag(sim_matrix)
+        pos_sim_loss = F.relu(0.8 - pos_sim).mean()  # 如果相似度 < 0.8，有懲罰
+        
+        # 組合 loss（控制 InfoNCE 的影響）
+        # InfoNCE 通常在 2-5 之間，我們希望總 loss 在 0.5-2 之間
+        total_loss = 0.3 * infonce_loss + 0.7 * pos_sim_loss
+        
+        # 診斷信息
+        with torch.no_grad():
+            neg_sim = sim_matrix.masked_fill(mask, 0).sum() / (batch_size * (batch_size - 1))
+        
+        return total_loss, {'pos_sim': pos_sim.mean().item(), 'neg_sim': neg_sim.item()}, {'infonce': infonce_loss.item()}
     
     def forward(
         self,
@@ -564,127 +633,152 @@ class UnifiedLoss(nn.Module):
         prev_feat: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        calculate unified multi-task loss with automatic weighting
+        計算多任務 Loss
         
-        Args:
-            outputs: model output dictionary
-            targets: target dictionary
-            prev_feat: previous frame features (for temporal consistency)
-        
-        Returns:
-            total_loss: total loss
-            loss_dict: individual task loss dictionary (包含原始 loss 和權重)
+        改進：
+        1. 每個 loss 都有明確的尺度範圍
+        2. 手動設定的權重確保平衡
+        3. 詳細的診斷輸出
         """
-        total_loss = 0
+        total_loss = torch.tensor(0.0, device=next(iter(outputs.values())).device)
         loss_dict = {}
         
-        # Task 0: temporal consistency loss
+        # ============================================================
+        # Task 0: Temporal Consistency (對比學習)
+        # 目標範圍: 0.3 - 1.0
+        # ============================================================
         if 'temporal' in outputs and prev_feat is not None:
-            refined = outputs['temporal']
-            # consistency with previous frame
-            temporal_loss = 1 - F.cosine_similarity(
-                refined.float(), prev_feat.float(), dim=-1
-            ).mean()
-            weighted_loss = self._weighted_loss(temporal_loss, task_idx=0)
-            total_loss += weighted_loss
+            temporal_loss, diag_info, raw_losses = self.temporal_contrastive_loss(
+                outputs['temporal'], prev_feat
+            )
+            
+            weight = self._get_weight('temporal', 0)
+            total_loss = total_loss + weight * temporal_loss
+            
             loss_dict['temporal'] = temporal_loss.item()
-            if self.use_uncertainty_weighting:
-                loss_dict['temporal_weight'] = torch.exp(-self.log_vars[0]).item()
+            loss_dict['temporal_weight'] = weight if isinstance(weight, float) else weight.item()
+            if diag_info:
+                loss_dict['temporal_pos_sim'] = diag_info['pos_sim']
+                loss_dict['temporal_neg_sim'] = diag_info['neg_sim']
+            if raw_losses:
+                loss_dict['temporal_infonce_raw'] = raw_losses['infonce']
         
-        # Task 1: depth order loss
+        # ============================================================
+        # Task 1: Depth Order (分類)
+        # 目標範圍: 0.3 - 1.0
+        # ============================================================
         if 'depth_order' in outputs and outputs['depth_order'] is not None:
             if 'depth_order' in targets:
-                depth_order_loss = self.ce_loss(
-                    outputs['depth_order'],
-                    targets['depth_order']
-                )
-                weighted_loss = self._weighted_loss(depth_order_loss, task_idx=1)
-                total_loss += weighted_loss
+                depth_order_loss = self.ce_loss(outputs['depth_order'], targets['depth_order'])
+                
+                weight = self._get_weight('depth_order', 1)
+                total_loss = total_loss + weight * depth_order_loss
+                
                 loss_dict['depth_order'] = depth_order_loss.item()
-                if self.use_uncertainty_weighting:
-                    loss_dict['depth_order_weight'] = torch.exp(-self.log_vars[1]).item()
+                loss_dict['depth_order_weight'] = weight if isinstance(weight, float) else weight.item()
         
-        # Task 2: depth regression loss (使用 Scale-Invariant Loss)
+        # ============================================================
+        # Task 2: Depth Regression (回歸) 🔥 重要任務
+        # 目標範圍: 0.1 - 0.5
+        # ============================================================
         if 'depth_regression' in outputs and outputs['depth_regression'] is not None:
             if 'depth_regression' in targets:
-                pred_depth = outputs['depth_regression']  # [B, 3]
-                target_depth = targets['depth_regression']  # [B, 3] or [B, 1]
+                pred_depth = outputs['depth_regression']
+                target_depth = targets['depth_regression']
                 
-                # 如果 target 只有 1 維，擴展到 3 維
                 if target_depth.dim() == 1:
                     target_depth = target_depth.unsqueeze(-1).expand(-1, 3)
                 elif target_depth.shape[-1] == 1:
                     target_depth = target_depth.expand(-1, 3)
                 
-                depth_reg_loss = self.scale_invariant_depth_loss(
-                    pred_depth, target_depth
-                )
-                weighted_loss = self._weighted_loss(depth_reg_loss, task_idx=2)
-                total_loss += weighted_loss
+                depth_reg_loss = self.scale_invariant_depth_loss(pred_depth, target_depth)
+                
+                weight = self._get_weight('depth_regression', 2)
+                total_loss = total_loss + weight * depth_reg_loss
+                
                 loss_dict['depth_regression'] = depth_reg_loss.item()
-                if self.use_uncertainty_weighting:
-                    loss_dict['depth_regression_weight'] = torch.exp(-self.log_vars[2]).item()
+                loss_dict['depth_regression_weight'] = weight if isinstance(weight, float) else weight.item()
+                
+                # 額外記錄原始誤差
+                with torch.no_grad():
+                    raw_error = F.l1_loss(pred_depth, target_depth)
+                    loss_dict['depth_l1_error'] = raw_error.item()
         
-        # Task 3: motion prediction loss (分離平移和旋轉，支援不確定性)
+        # ============================================================
+        # Task 3: Motion Prediction (回歸) 🔥 重要任務
+        # 目標範圍: 0.05 - 0.3
+        # ============================================================
         if 'motion' in outputs and 'motion' in targets:
-            # 使用預測的不確定性（如果有的話）
-            motion_log_var = outputs.get('motion_log_var', None)
+            motion_loss = self.motion_loss(outputs['motion'], targets['motion'])
             
-            motion_loss = self.motion_loss(
-                outputs['motion'],
-                targets['motion'],
-                log_var=motion_log_var
-            )
-            weighted_loss = self._weighted_loss(motion_loss, task_idx=3)
-            total_loss += weighted_loss
+            weight = self._get_weight('motion', 3)
+            total_loss = total_loss + weight * motion_loss
+            
             loss_dict['motion'] = motion_loss.item()
-            if self.use_uncertainty_weighting:
-                loss_dict['motion_weight'] = torch.exp(-self.log_vars[3]).item()
-            
-            # 記錄平均不確定性（用於監控）
-            if motion_log_var is not None:
-                loss_dict['motion_avg_uncertainty'] = torch.exp(motion_log_var).mean().item()
-            
-            # Motion Quality 監督（如果有標籤）
-            if 'motion_quality' in outputs and 'motion_quality_label' in targets:
-                quality_loss = F.binary_cross_entropy(
-                    outputs['motion_quality'],
-                    targets['motion_quality_label']
-                )
-                total_loss += 0.1 * quality_loss  # 小權重
-                loss_dict['motion_quality'] = quality_loss.item()
-            
-            # Global Scale 監督（如果有標籤）
-            if 'motion_global_scale' in outputs and 'motion_scale_label' in targets:
-                scale_loss = F.mse_loss(
-                    outputs['motion_global_scale'],
-                    targets['motion_scale_label']
-                )
-                total_loss += 0.1 * scale_loss
-                loss_dict['scale'] = scale_loss.item()
+            loss_dict['motion_weight'] = weight if isinstance(weight, float) else weight.item()
         
-        # Task 4: scene classification loss
+        # ============================================================
+        # Task 4: Scene Classification (輔助任務)
+        # ============================================================
         if 'scene_class' in outputs and 'scene_class' in targets:
-            scene_loss = self.ce_loss(
-                outputs['scene_class'],
-                targets['scene_class']
-            )
-            weighted_loss = self._weighted_loss(scene_loss, task_idx=4)
-            total_loss += weighted_loss
+            scene_loss = self.ce_loss(outputs['scene_class'], targets['scene_class'])
+            
+            weight = self._get_weight('scene_class', 4)
+            total_loss = total_loss + weight * scene_loss
+            
             loss_dict['scene_class'] = scene_loss.item()
-            if self.use_uncertainty_weighting:
-                loss_dict['scene_class_weight'] = torch.exp(-self.log_vars[4]).item()
+            loss_dict['scene_class_weight'] = weight if isinstance(weight, float) else weight.item()
+        
+        # ============================================================
+        # 遮擋重建 Loss (如果有)
+        # ============================================================
+        if 'occlusion_reconstruction' in outputs and 'clean_features' in targets:
+            recon_loss = F.mse_loss(
+                outputs['occlusion_reconstruction'],
+                targets['clean_features']
+            )
+            weight = self._get_weight('occlusion_recon')
+            total_loss = total_loss + weight * recon_loss
+            loss_dict['occlusion_recon'] = recon_loss.item()
+        
+        # ============================================================
+        # Memory Quality 正則化 (🔥 強化版)
+        # 防止 memory_quality 趨向 0 或 1
+        # ============================================================
+        if 'memory_quality' in outputs:
+            mq = outputs['memory_quality']
+            
+            # 雙向懲罰：鼓勵 mq 在 0.3-0.7 之間
+            # 低於 0.3 的懲罰更強（防止 GRU 不工作）
+            mq_reg_low = torch.clamp(0.35 - mq, min=0) ** 2 * 2.0  # 低於 0.35 強懲罰
+            mq_reg_high = torch.clamp(mq - 0.65, min=0) ** 2       # 高於 0.65 輕懲罰
+            
+            # 額外的中心化 loss：鼓勵接近 0.5
+            mq_center = (mq - 0.5) ** 2 * 0.1
+            
+            mq_reg = (mq_reg_low + mq_reg_high + mq_center).mean()
+            
+            weight = self._get_weight('memory_quality_reg')
+            total_loss = total_loss + weight * mq_reg
+            
+            loss_dict['memory_quality'] = mq.mean().item()
+            loss_dict['memory_quality_reg'] = mq_reg.item()
+        
+        # ============================================================
+        # 總 Loss 診斷
+        # ============================================================
+        loss_dict['total_loss'] = total_loss.item()
         
         return total_loss, loss_dict
     
     def get_task_weights(self) -> Dict[str, float]:
-        """取得當前各任務的自動權重 (用於監控)"""
+        """取得當前各任務的權重"""
         if self.use_uncertainty_weighting:
             task_names = ['temporal', 'depth_order', 'depth_regression', 'motion', 'scene_class']
             weights = torch.exp(-self.log_vars).detach().cpu().numpy()
             return {name: float(w) for name, w in zip(task_names, weights)}
         else:
-            return {}
+            return self.task_weights.copy()
 
 
 # ============================================================
@@ -709,14 +803,22 @@ def get_model_info(model: UnifiedTempoVLM) -> Dict:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     # 各分支參數量
-    branch_params = {
-        'shared_encoder': sum(p.numel() for p in model.shared_encoder.parameters()),
-        'temporal': sum(p.numel() for n, p in model.named_parameters() if 'temporal' in n and 'gru' not in n.lower()),
-        'depth_order': sum(p.numel() for p in model.depth_order_head.parameters()),
-        'depth_regression': sum(p.numel() for p in model.depth_regression_head.parameters()),
-        'motion': sum(p.numel() for n, p in model.named_parameters() if 'motion' in n),
-        'scene_classifier': sum(p.numel() for p in model.scene_classifier.parameters()),
-    }
+    branch_params = {}
+    
+    # Shared Encoder (包含 Transformer 或 MLP)
+    if model.use_transformer_encoder:
+        encoder_params = sum(p.numel() for p in model.input_proj.parameters())
+        encoder_params += sum(p.numel() for p in model.transformer_encoder.parameters())
+        encoder_params += sum(p.numel() for p in model.encoder_norm.parameters())
+        branch_params['shared_encoder (Transformer)'] = encoder_params
+    else:
+        branch_params['shared_encoder (MLP)'] = sum(p.numel() for p in model.shared_encoder.parameters())
+    
+    branch_params['temporal'] = sum(p.numel() for n, p in model.named_parameters() if 'temporal' in n and 'gru' not in n.lower() and 'transformer' not in n.lower())
+    branch_params['depth_order'] = sum(p.numel() for p in model.depth_order_head.parameters())
+    branch_params['depth_regression'] = sum(p.numel() for p in model.depth_regression_head.parameters())
+    branch_params['motion'] = sum(p.numel() for n, p in model.named_parameters() if 'motion' in n)
+    branch_params['scene_classifier'] = sum(p.numel() for p in model.scene_classifier.parameters())
     
     # GRU 記憶相關參數
     if model.use_gru_memory:
@@ -739,9 +841,16 @@ def get_model_info(model: UnifiedTempoVLM) -> Dict:
 if __name__ == "__main__":
     print("Testing UnifiedTempoVLM...")
 
-    # 測試無 GRU 模式
-    print("\n========== 測試基本模式（無 GRU）==========")
-    model = UnifiedTempoVLM(feat_dim=1536, hidden_dim=768, use_gru_memory=False)
+    # 測試 Transformer Encoder 模式
+    print("\n========== 測試 Transformer Encoder 模式 ==========")
+    model = UnifiedTempoVLM(
+        feat_dim=1536, 
+        hidden_dim=768, 
+        use_gru_memory=False,
+        use_transformer_encoder=True,
+        num_encoder_layers=2,
+        num_heads=8
+    )
     model.eval()
     
     batch_size = 2
@@ -768,9 +877,16 @@ if __name__ == "__main__":
     print(f"  scene_class output: {outputs['scene_class'].shape}")
     print(f"  next_hidden_state: {hidden}")  # 應該是 None（無 GRU 模式）
 
-    # 測試 GRU 記憶模式
-    print("\n========== 測試 GRU 記憶模式 ==========")
-    model_gru = UnifiedTempoVLM(feat_dim=1536, hidden_dim=768, use_gru_memory=True)
+    # 測試 GRU + Transformer 組合模式
+    print("\n========== 測試 GRU + Transformer 組合模式 ==========")
+    model_gru = UnifiedTempoVLM(
+        feat_dim=1536, 
+        hidden_dim=768, 
+        use_gru_memory=True,
+        use_transformer_encoder=True,
+        num_encoder_layers=2,
+        num_heads=8
+    )
     model_gru.eval()
     
     print("\n模擬連續幀處理...")
@@ -786,16 +902,38 @@ if __name__ == "__main__":
               f"memory_quality={outputs.get('memory_quality', 'N/A'):.3f}, "
               f"hidden_state shape={hidden_state.shape if hidden_state is not None else 'None'}")
 
+    # 測試舊版 MLP 模式（向後兼容）
+    print("\n========== 測試舊版 MLP 模式（向後兼容）==========")
+    model_mlp = UnifiedTempoVLM(
+        feat_dim=1536, 
+        hidden_dim=768, 
+        use_gru_memory=False,
+        use_transformer_encoder=False  # 使用舊版 MLP
+    )
+    model_mlp.eval()
+    
+    outputs_mlp, _ = model_mlp(
+        curr_feat=curr_feat,
+        prev_feat=prev_feat,
+        region_a_feat=region_a,
+        region_b_feat=region_b,
+        tasks=['temporal', 'depth_order', 'depth_regression', 'motion']
+    )
+    print(f"  MLP mode - temporal output: {outputs_mlp['temporal'].shape}")
+    print(f"  MLP mode - depth_regression output: {outputs_mlp['depth_regression'].shape}")
+
     print("\nTesting loss calculation with automatic weighting...")
     loss_fn = UnifiedLoss(use_uncertainty_weighting=True)
+    
+    # 模擬 GT 深度標籤（來自 ScanNet 數據集）
     targets = {
         'depth_order': torch.randint(0, 2, (batch_size,)),
-        'depth_regression': torch.rand(batch_size, 3) * 5 + 0.5,  # 0.5~5.5m 的深度
+        'depth_regression': torch.rand(batch_size, 3) * 5 + 0.5,  # 0.5~5.5m 的深度（GT）
         'motion': torch.randn(batch_size, 6) * 0.1,  # 小的運動值
         'scene_class': torch.randint(0, 20, (batch_size,)),
     }
     
-    # 使用無 GRU 模型的 outputs
+    # 使用 Transformer 模型的 outputs
     outputs, _ = model(
         curr_feat=torch.randn(batch_size, 1536),
         prev_feat=torch.randn(batch_size, 1536),
@@ -820,21 +958,43 @@ if __name__ == "__main__":
     for i, name in enumerate(['temporal', 'depth_order', 'depth_regression', 'motion', 'scene_class']):
         print(f"    {name}: log_var = {loss_fn.log_vars[i].item():.4f}")
 
-    print("\nModel Information:")
+    print("\n========== Model Information ==========")
+    
+    print("\n📊 Transformer Encoder 模式:")
     info = get_model_info(model)
     print(f"  Total Parameters: {info['total_params']:,}")
     print(f"  Branch Parameters:")
     for branch, params in info['branch_params'].items():
         print(f"    {branch}: {params:,}")
     
+    print("\n🧠 GRU + Transformer 模式:")
     info_gru = get_model_info(model_gru)
-    print(f"\n  GRU Model Total Parameters: {info_gru['total_params']:,}")
-    print(f"  GRU Branch Parameters:")
+    print(f"  Total Parameters: {info_gru['total_params']:,}")
+    print(f"  Branch Parameters:")
     for branch, params in info_gru['branch_params'].items():
         print(f"    {branch}: {params:,}")
+    
+    print("\n📦 舊版 MLP 模式:")
+    info_mlp = get_model_info(model_mlp)
+    print(f"  Total Parameters: {info_mlp['total_params']:,}")
+    print(f"  Branch Parameters:")
+    for branch, params in info_mlp['branch_params'].items():
+        print(f"    {branch}: {params:,}")
+    
+    # 比較參數增量
+    param_increase = info['total_params'] - info_mlp['total_params']
+    print(f"\n📈 Transformer 相比 MLP 增加參數: {param_increase:,} ({param_increase/info_mlp['total_params']*100:.1f}%)")
     
     # 測試 Loss 函數的參數量
     loss_params = sum(p.numel() for p in loss_fn.parameters())
     print(f"\n  Loss function learnable params: {loss_params}")
+    
+    print("\n" + "="*60)
+    print("💡 重要說明:")
+    print("  1. 深度標籤（depth_regression）來自 ScanNet 的 GT 深度圖")
+    print("  2. 模型學習從 RGB 特徵預測深度值")
+    print("  3. Transformer Encoder 提供更強的特徵表達能力")
+    print("  4. 可以用 use_transformer_encoder=False 切換回舊版 MLP")
+    print("="*60)
 
     print("\n✅ Testing completed!")
