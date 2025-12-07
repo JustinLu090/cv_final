@@ -54,6 +54,7 @@ class AdaptiveMemoryBuffer:
         
         # 記憶儲存
         self.features = []      # 特徵張量
+        self.edge_features = [] # NEW: 邊緣特徵 (用於場景與遮擋比對)
         self.qualities = []     # 品質分數 (0-1)
         self.timestamps = []    # 幀索引
         self.images = []        # 原始圖片 (可選)
@@ -63,6 +64,7 @@ class AdaptiveMemoryBuffer:
         self.feature_mean = None
         self.feature_std = None
         self.prev_feat = None
+        self.last_valid_feat = None  # NEW: 上一個有效(未被遮擋)的特徵
         
         # 圖像統計（用於檢測遮擋）
         self.image_brightness_history = []
@@ -107,7 +109,9 @@ class AdaptiveMemoryBuffer:
     
     def detect_image_occlusion(self, image):
         """
-        圖像層面檢測遮擋（檢測中央區域黑色/異常）
+        圖像層面檢測遮擋（支援 YOLO 不規則遮擋和傳統中央遮擋）
+        
+        改進：不再限於中央區域，而是檢測整張圖片中的黑色/異常區域
         
         Returns:
             occlusion_score: 0-1, 越高越可能被遮擋
@@ -126,108 +130,93 @@ class AdaptiveMemoryBuffer:
             
         h, w = img_array.shape[:2]
         
-        # 檢測中央區域
+        occlusion_score = 0.0
+        
+        # ============================================================
+        # 方法 1: 全圖黑色區域檢測（支援 YOLO bounding box 遮擋）
+        # ============================================================
+        if len(img_array.shape) == 3:
+            brightness = img_array.mean(axis=2)
+        else:
+            brightness = img_array
+        
+        # 黑色像素比例（整張圖，不只中央）
+        black_pixels = (brightness < 15).sum()
+        black_ratio = black_pixels / (h * w)
+        
+        # 白色像素比例
+        white_pixels = (brightness > 240).sum()
+        white_ratio = white_pixels / (h * w)
+        
+        # 極端顏色總比例
+        extreme_ratio = black_ratio + white_ratio
+        
+        # 任何位置的大面積黑色/白色都算遮擋
+        if extreme_ratio > 0.15:  # 降低閾值，因為 YOLO 遮擋可能不到 25%
+            occlusion_score += 0.8 * min(extreme_ratio / 0.4, 1.0)  # 40% 極端色 = 滿分
+        
+        # ============================================================
+        # 方法 2: 連通區域檢測（檢測 YOLO bounding box）
+        # ============================================================
+        # 找出黑色連通區域
+        black_mask = (brightness < 15).astype(np.uint8) * 255
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(black_mask, connectivity=8)
+        
+        # 檢查是否有大的黑色連通區域（可能是 YOLO 遮擋）
+        large_black_regions = 0
+        total_black_area = 0
+        
+        for i in range(1, num_labels):  # 跳過背景 (label 0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area > 500:  # 大於 500 像素的黑色區域
+                large_black_regions += 1
+                total_black_area += area
+        
+        # 如果有多個大黑色區域（YOLO 遮擋多個物體）或單個超大區域
+        if large_black_regions > 0:
+            region_score = min(large_black_regions * 0.2, 0.5)  # 多個物件遮擋
+            area_score = min(total_black_area / (h * w * 0.5), 0.5)  # 總面積
+            occlusion_score += max(region_score, area_score)
+        
+        # ============================================================
+        # 方法 3: 低紋理檢測（在有遮擋的區域）
+        # ============================================================
+        # 只檢測黑色/白色區域的紋理
+        if extreme_ratio > 0.1:
+            extreme_mask = ((brightness < 15) | (brightness > 240)).astype(np.uint8)
+            masked_brightness = brightness * extreme_mask
+            
+            if extreme_mask.sum() > 100:  # 至少 100 個像素
+                # 計算遮擋區域的 Laplacian 方差
+                masked_uint8 = masked_brightness.astype(np.uint8)
+                laplacian = cv2.Laplacian(masked_uint8, cv2.CV_64F)
+                laplacian_var = laplacian.var()
+                
+                # 遮擋區域應該非常平滑
+                if laplacian_var < 50:
+                    occlusion_score += 0.2
+        
+        # ============================================================
+        # 方法 4: 中央區域加權（傳統中央遮擋仍然重要）
+        # ============================================================
+        # 檢測中央區域，給予額外加權
         cx, cy = w // 2, h // 2
         margin = min(w, h) // 4
         center = img_array[cy-margin:cy+margin, cx-margin:cx+margin]
         
-        occlusion_score = 0.0
-        
-        # ============================================================
-        # 方法 1: 極端顏色檢測（黑、白、純色）
-        # ============================================================
         if len(center.shape) == 3:
-            brightness = center.mean(axis=2)
-            # 轉換到 HSV 檢測飽和度
-            center_hsv = cv2.cvtColor(center.astype(np.uint8), cv2.COLOR_RGB2HSV)
-            saturation = center_hsv[:, :, 1]
-            value = center_hsv[:, :, 2]
+            center_brightness = center.mean(axis=2)
         else:
-            brightness = center
-            saturation = np.zeros_like(center)
-            value = center
+            center_brightness = center
         
-        # 黑色區域（亮度 < 15）
-        black_ratio = (brightness < 15).mean()
-        # 白色區域（亮度 > 240）
-        white_ratio = (brightness > 240).mean()
-        # 極端顏色總比例
-        extreme_ratio = black_ratio + white_ratio
+        center_black_ratio = (center_brightness < 15).mean()
+        center_white_ratio = (center_brightness > 240).mean()
+        center_extreme = center_black_ratio + center_white_ratio
         
-        if extreme_ratio > 0.3:
-            occlusion_score += 0.3 * min(extreme_ratio, 1.0)
+        # 中央區域遮擋給予額外分數
+        if center_extreme > 0.3:
+            occlusion_score += 0.3 * min(center_extreme, 1.0)
         
-        # ============================================================
-        # 方法 2: 低紋理/低方差檢測（任何單色遮擋）
-        # ============================================================
-        # 計算局部方差（紋理豐富度）
-        center_gray = brightness if len(center.shape) == 2 else center.mean(axis=2)
-        
-        # Laplacian 方差（邊緣/紋理指標）
-        laplacian = cv2.Laplacian(center_gray.astype(np.uint8), cv2.CV_64F)
-        laplacian_var = laplacian.var()
-        
-        # 正常場景通常有 laplacian_var > 500
-        if laplacian_var < 100:
-            occlusion_score += 0.35  # 非常平滑，很可能是遮擋
-        elif laplacian_var < 300:
-            occlusion_score += 0.20  # 較平滑
-        elif laplacian_var < 500:
-            occlusion_score += 0.10  # 略平滑
-        
-        # ============================================================
-        # 方法 3: 顏色單一性檢測（檢測任何純色遮擋）
-        # ============================================================
-        if len(center.shape) == 3:
-            # 計算顏色的標準差
-            color_std = center.std(axis=(0, 1)).mean()  # 各通道的空間標準差
-            
-            # 正常場景通常有 color_std > 30
-            if color_std < 10:
-                occlusion_score += 0.25  # 顏色非常單一
-            elif color_std < 20:
-                occlusion_score += 0.15
-            elif color_std < 30:
-                occlusion_score += 0.05
-        
-        # ============================================================
-        # 方法 4: 邊緣與中心對比（遮擋通常只在中心）
-        # ============================================================
-        # 邊緣區域
-        edge_top = img_array[:h//4, :, :] if len(img_array.shape) == 3 else img_array[:h//4, :]
-        edge_bottom = img_array[-h//4:, :, :] if len(img_array.shape) == 3 else img_array[-h//4:, :]
-        
-        edge_laplacian_top = cv2.Laplacian(
-            edge_top.mean(axis=2).astype(np.uint8) if len(edge_top.shape) == 3 else edge_top.astype(np.uint8), 
-            cv2.CV_64F
-        ).var()
-        edge_laplacian_bottom = cv2.Laplacian(
-            edge_bottom.mean(axis=2).astype(np.uint8) if len(edge_bottom.shape) == 3 else edge_bottom.astype(np.uint8), 
-            cv2.CV_64F
-        ).var()
-        edge_laplacian = (edge_laplacian_top + edge_laplacian_bottom) / 2
-        
-        # 如果邊緣有紋理但中心沒有，很可能是中心遮擋
-        if edge_laplacian > 300 and laplacian_var < 200:
-            texture_contrast = (edge_laplacian - laplacian_var) / (edge_laplacian + 1)
-            occlusion_score += 0.2 * min(texture_contrast, 1.0)
-        
-        # ============================================================
-        # 方法 5: 與歷史亮度/紋理比較
-        # ============================================================
-        current_brightness = img_array.mean()
-        if len(self.image_brightness_history) >= 3:
-            avg_brightness = np.mean(self.image_brightness_history[-5:])
-            # 亮度突然大幅變化（變暗或變亮）
-            brightness_change = abs(current_brightness - avg_brightness) / (avg_brightness + 1)
-            if brightness_change > 0.3:
-                occlusion_score += 0.15 * min(brightness_change, 1.0)
-        
-        # 更新歷史
-        self.image_brightness_history.append(current_brightness)
-        if len(self.image_brightness_history) > 20:
-            self.image_brightness_history.pop(0)
-            
         return min(occlusion_score, 1.0)
     
     def detect_anomaly(self, current_feat, image=None):
@@ -277,8 +266,8 @@ class AdaptiveMemoryBuffer:
         image_occlusion = self.detect_image_occlusion(image)
         
         # === 組合異常分數 ===
-        # 特徵層面和圖像層面各佔一半
-        anomaly_score = 0.5 * feature_anomaly + 0.5 * image_occlusion
+        # 特徵層面權重較高 (0.7)，因為它比較能反映語意變化
+        anomaly_score = 0.7 * feature_anomaly + 0.3 * image_occlusion
         
         # === Z-Score 動態閾值判斷 ===
         is_anomaly = self._check_anomaly_zscore(anomaly_score, feature_anomaly, image_occlusion)
@@ -303,7 +292,7 @@ class AdaptiveMemoryBuffer:
         
         # 冷啟動：使用固定閾值，但以圖像遮擋為主
         if len(self.anomaly_score_history) < min_history:
-            is_anomaly = image_occlusion > 0.45  # 冷啟動時閾值更高
+            is_anomaly = image_occlusion > 0.60  # 冷啟動時閾值更高 (0.45 -> 0.60)
             
             # 如果不是異常，加入歷史
             if not is_anomaly:
@@ -323,13 +312,14 @@ class AdaptiveMemoryBuffer:
         is_anomaly = False
         
         # 條件 1: 圖像遮擋分數絕對值很高（明確遮擋）
-        # 提高閾值從 0.30 到 0.50
-        if image_occlusion > 0.50:
+        # 條件 1: 圖像遮擋分數絕對值很高（明確遮擋）
+        # 提高閾值從 0.30 到 0.50 (v4: 回調到 0.50, v5: 用戶要求提高到 0.60)
+        if image_occlusion > 0.60:
             is_anomaly = True
         
         # 條件 2: 圖像有遮擋跡象 + 圖像 Z-Score 很高
-        # 提高 img 閾值從 0.15 到 0.25，z_score 閾值也提高
-        elif image_occlusion > 0.25 and img_z_score > self.z_score_threshold * 1.2:
+        # 提高 img 閾值從 0.25 到 0.35
+        elif image_occlusion > 0.35 and img_z_score > self.z_score_threshold * 1.2:
             is_anomaly = True
         
         # 條件 3: 圖像 Z-Score 極端高（很罕見的情況）
@@ -344,10 +334,13 @@ class AdaptiveMemoryBuffer:
         
         return is_anomaly
     
-    def add_frame(self, feat, timestamp, image=None, force=False, adapter_meta=None):
+    def add_frame(self, feat, timestamp, image=None, force=False, adapter_meta=None, edge_feat=None):
         """
         嘗試將幀加入記憶庫
         
+        Args:
+            edge_feat: 邊緣特徵 (可選)，如果未提供但有 image，可嘗試自動計算
+            
         Returns:
             added: bool, 是否成功加入
             quality: float, 品質分數
@@ -377,6 +370,14 @@ class AdaptiveMemoryBuffer:
         
         # 加入記憶庫
         self.features.append(feat.clone())
+        
+        # 儲存邊緣特徵
+        if edge_feat is not None:
+             self.edge_features.append(edge_feat.clone())
+        else:
+             # 如果沒提供，暫時存主特徵 (雖然不理想，但比沒有好)
+             self.edge_features.append(feat.clone())
+             
         self.qualities.append(quality)
         self.timestamps.append(timestamp)
         if image is not None:
@@ -395,9 +396,15 @@ class AdaptiveMemoryBuffer:
                     self.images.pop(min_idx)
                 if self.adapter_metas:
                     self.adapter_metas.pop(min_idx)
+                if len(self.edge_features) > min_idx:
+                    self.edge_features.pop(min_idx)
         
         self._update_statistics()
         self.prev_feat = feat.clone()
+        
+        # 如果這一幀是正常的(非異常)，它就是我們的"最後目擊證人"
+        if not is_anomaly:
+            self.last_valid_feat = feat.clone()
         
         return True, quality, anomaly_score, False, debug_info
     
@@ -440,17 +447,26 @@ class AdaptiveMemoryBuffer:
                 feat.flatten().unsqueeze(0)
             ).item()
             
-            # === 新增：場景匹配度檢測 ===
-            scene_match = 1.0  # 預設完全匹配
-            if edge_feat is not None:
-                # 比較記憶與邊緣特徵的相似度
-                # 如果邊緣（未遮擋區域）與記憶差異大，可能場景已變化
+            # === 新增：場景匹配度檢測 (v6.1 Edge-Based Logic) ===
+            scene_match = 1.0
+            
+            # 使用邊緣特徵比對 (Edge vs Edge)
+            # 這是最準確的方法：比較當前幀的邊緣 vs 記憶幀的邊緣
+            if edge_feat is not None and i < len(self.edge_features):
+                stored_edge = self.edge_features[i]
                 edge_sim = F.cosine_similarity(
                     edge_feat.flatten().unsqueeze(0),
+                    stored_edge.flatten().unsqueeze(0)
+                ).item()
+                scene_match = max(0.0, edge_sim)
+                
+            # 備用 1: 使用 last_valid_feat (如果有) - 較不準確，可能有過時風險
+            elif self.last_valid_feat is not None:
+                scene_sim = F.cosine_similarity(
+                    self.last_valid_feat.flatten().unsqueeze(0),
                     feat.flatten().unsqueeze(0)
                 ).item()
-                # 邊緣相似度越低，場景匹配度越低
-                scene_match = max(0.0, edge_sim)
+                scene_match = max(0.0, scene_sim)
             
             # 綜合分數（加入場景匹配權重）
             score = time_weight * 0.2 + spatial_sim * 0.2 + quality * 0.3 + scene_match * 0.3
@@ -547,12 +563,14 @@ class AdaptiveMemoryBuffer:
     def clear(self):
         """清空記憶庫和歷史統計"""
         self.features = []
+        self.edge_features = []
         self.qualities = []
         self.timestamps = []
         self.images = []
         self.feature_mean = None
         self.feature_std = None
         self.prev_feat = None
+        self.last_valid_feat = None
         
         # 清空圖像亮度歷史
         self.image_brightness_history = []
