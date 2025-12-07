@@ -41,16 +41,27 @@ from qwen_vl_utils import process_vision_info
 
 from utils.memory_utils import AdaptiveMemoryBuffer
 
+# YOLO 物件遮擋（可選）
+try:
+    from utils.yolo_occlusion import YOLOOccluder
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    YOLOOccluder = None
+    print("⚠️ YOLO 未安裝，物件遮擋功能不可用")
+
 
 class CompleteDemoVisualizer:
     """TempoVLM 完整展示視覺化器"""
     
     def __init__(self, unified_model_path, device='cuda'):
         self.device = device
+        self.checkpoint_path = unified_model_path  # 記錄使用的 checkpoint
         
         print("=" * 70)
         print("TempoVLM Complete Demo Visualizer")
         print("=" * 70)
+        print(f"\n📦 使用 Checkpoint: {unified_model_path}")
         
         # 載入模型
         print("\nloading...")
@@ -96,9 +107,22 @@ class CompleteDemoVisualizer:
         ).to(self.device)
         
         if 'model_state_dict' in checkpoint:
-            self.unified_model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict_to_load = checkpoint['model_state_dict']
         else:
-            self.unified_model.load_state_dict(checkpoint)
+            state_dict_to_load = checkpoint
+        
+        # 🔧 處理舊 checkpoint 的 memory_quality_gate 架構不匹配問題
+        # 舊版: 3 層 (0: Linear, 1: GELU, 2: Linear)
+        # 新版: 4 層 (0: Linear, 1: GELU, 2: Dropout, 3: Linear)
+        if 'memory_quality_gate.2.weight' in state_dict_to_load and \
+           'memory_quality_gate.3.weight' not in state_dict_to_load:
+            print("  ⚠️ 偵測到舊版 checkpoint，正在遷移 memory_quality_gate 架構...")
+            # 將舊的 layer 2 (最後的 Linear) 移到 layer 3
+            state_dict_to_load['memory_quality_gate.3.weight'] = state_dict_to_load.pop('memory_quality_gate.2.weight')
+            state_dict_to_load['memory_quality_gate.3.bias'] = state_dict_to_load.pop('memory_quality_gate.2.bias')
+            print("  ✅ 架構遷移完成 (Dropout 層使用預設初始化)")
+        
+        self.unified_model.load_state_dict(state_dict_to_load, strict=False)
         
         self.unified_model.eval()
         self.unified_model.float()
@@ -153,6 +177,35 @@ class CompleteDemoVisualizer:
                     features = outputs['temporal']
         
         return features
+
+    def extract_edge_features(self, image):
+        """
+        提取邊緣特徵 (用於 v6.1 Scene Change Detection)
+        
+        方法: 將圖片中心 60% 區域塗黑，只保留邊緣，然後提取特徵。
+        這樣強制模型只看周圍環境 (牆壁、天花板、地板)，忽略中心物體。
+        """
+        import numpy as np
+        from PIL import Image as PILImage
+        
+        if isinstance(image, PILImage.Image):
+            img_array = np.array(image).copy()
+        else:
+            img_array = image.copy()
+            
+        h, w = img_array.shape[:2]
+        
+        # 定義遮罩區域 (保留邊緣 20%)
+        margin_h = int(h * 0.2)
+        margin_w = int(w * 0.2)
+        
+        # 將中心區域塗黑
+        img_array[margin_h:h-margin_h, margin_w:w-margin_w] = 0
+        
+        masked_image = PILImage.fromarray(img_array)
+        
+        # 提取特徵 (不使用 Adapter，只取純視覺特徵)
+        return self.extract_features(masked_image, use_adapter=False)
     
     def generate_description(self, image, prompt="Describe what you see in the center of this image."):
         messages = [{
@@ -185,9 +238,61 @@ class CompleteDemoVisualizer:
             response = response.split("assistant")[-1].strip()
         return response
     
-    def generate_with_injection(self, image, memory_feat, prompt, injection_strength=0.5, injection_method='full'):
+    def detect_occlusion_regions(self, image):
         """
-        🧠 Direct Feature Injection - 採用 occlusion_tester.py 的成功邏輯
+        🔍 自動偵測圖像中的遮擋區域
+        
+        Args:
+            image: PIL Image 或 numpy array
+            
+        Returns:
+            occlusion_mask: (H, W) 的 numpy array，遮擋區域為 1，其他為 0
+        """
+        if isinstance(image, Image.Image):
+            img_array = np.array(image)
+        else:
+            img_array = image
+        
+        if img_array.shape[-1] == 3:
+            # RGB 圖像
+            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img_array
+        
+        h, w = gray.shape
+        
+        # 方法1: 檢測純黑色區域 (遮擋常用黑色)
+        black_mask = (gray < 10).astype(np.uint8)
+        
+        # 方法2: 檢測低紋理區域（遮擋通常是均勻的）
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        low_texture_mask = (np.abs(laplacian) < 5).astype(np.uint8)
+        
+        # 結合兩種方法
+        combined_mask = np.logical_and(black_mask, low_texture_mask).astype(np.uint8)
+        
+        # 形態學操作：去除噪點、填充小孔
+        kernel = np.ones((5, 5), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+        
+        # 只保留較大的連通區域（過濾小噪點）
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(combined_mask, connectivity=8)
+        
+        filtered_mask = np.zeros_like(combined_mask)
+        min_area = (h * w) * 0.01  # 至少佔 1% 面積
+        
+        for i in range(1, num_labels):  # 跳過背景 (label 0)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area > min_area:
+                filtered_mask[labels == i] = 1
+        
+        return filtered_mask
+    
+    def generate_with_injection(self, image, memory_feat, prompt, injection_strength=0.5, injection_method='full', 
+                               occlusion_info=None):
+        """
+        🧠 Direct Feature Injection - 自動偵測遮擋區域並針對性注入
         
         將記憶特徵注入到視覺編碼器輸出中
         
@@ -197,6 +302,7 @@ class CompleteDemoVisualizer:
             prompt: 提問
             injection_strength: 注入強度 (0-1)
             injection_method: 'raw', 'full', 'strong', 'adaptive'
+            occlusion_info: 遮擋物件資訊 (來自 YOLO)，包含 bbox
         
         Returns:
             str: 生成的回答
@@ -233,7 +339,31 @@ class CompleteDemoVisualizer:
                 torch.nn.init.zeros_(self.feature_projector.bias)
                 self.feature_projector = self.feature_projector.to(self.device).half()
         
-        def create_injection_hook(method, strength):
+        # 🔍 自動偵測或使用提供的遮擋區域資訊
+        occlusion_mask_2d = None
+        if occlusion_info and 'objects' in occlusion_info:
+            # 使用 YOLO 提供的 bbox 生成遮罩
+            img_array = np.array(image) if isinstance(image, Image.Image) else image
+            h, w = img_array.shape[:2]
+            occlusion_mask_2d = np.zeros((h, w), dtype=np.float32)
+            
+            for obj in occlusion_info['objects']:
+                x1, y1, x2, y2 = obj['bbox']
+                # 擴展 bbox 周圍區域（補償遮擋影響範圍）
+                margin = 20
+                x1 = max(0, x1 - margin)
+                y1 = max(0, y1 - margin)
+                x2 = min(w, x2 + margin)
+                y2 = min(h, y2 + margin)
+                occlusion_mask_2d[y1:y2, x1:x2] = 1.0
+        else:
+            # 自動偵測遮擋區域
+            occlusion_mask_2d = self.detect_occlusion_regions(image).astype(np.float32)
+        
+        # 將遮罩轉換為 Tensor 供 hook 使用
+        occlusion_mask_tensor = torch.from_numpy(occlusion_mask_2d).to(self.device)
+        
+        def create_injection_hook(method, strength, occl_mask):
             def injection_hook(module, input, output):
                 nonlocal enhanced_feat_copy
                 
@@ -260,40 +390,84 @@ class CompleteDemoVisualizer:
                     orig_std = output.std() + 1e-6
                     proj_mean = projected_expanded.mean()
                     proj_std = projected_expanded.std() + 1e-6
-                    blended_mean = 0.5 * proj_mean + 0.5 * orig_mean
-                    blended_std = torch.max(0.7 * proj_std + 0.3 * orig_std, 0.5 * proj_std)
+                    
+                    # 🔥 更激進的記憶優先策略（提高記憶特徵的影響力）
+                    blended_mean = 0.4 * proj_mean + 0.6 * orig_mean  # 從 0.5/0.5 改為 0.4/0.6
+                    blended_std = torch.max(0.8 * proj_std + 0.2 * orig_std, 0.6 * proj_std)  # 從 0.7/0.3 改為 0.8/0.2
                     projected_normalized = (projected_expanded - proj_mean) / proj_std * blended_std + blended_mean
                     
-                    # 中心遮罩：只在中心區域注入，減少對周邊上下文的污染
+                    # 🎯 動態遮擋遮罩：根據實際遮擋區域生成 patch 級別的遮罩
                     if num_patches > 4:
                         side = int(num_patches ** 0.5)
-                        if side * side == num_patches:
+                        if side * side == num_patches and occl_mask is not None:
+                            # 將 2D 遮擋遮罩降採樣到 patch 網格
+                            h, w = occl_mask.shape
+                            patch_h = h // side
+                            patch_w = w // side
+                            
+                            # 為每個 patch 計算遮擋比例
+                            injection_mask = torch.zeros((1, num_patches, 1), device=output.device)
+                            for i in range(side):
+                                for j in range(side):
+                                    patch_idx = i * side + j
+                                    y_start = i * patch_h
+                                    y_end = (i + 1) * patch_h if i < side - 1 else h
+                                    x_start = j * patch_w
+                                    x_end = (j + 1) * patch_w if j < side - 1 else w
+                                    
+                                    # 計算該 patch 的遮擋比例
+                                    patch_region = occl_mask[y_start:y_end, x_start:x_end]
+                                    occlusion_ratio = patch_region.mean().item()
+                                    
+                                    # 遮擋比例越高，注入強度越大
+                                    # 並擴展影響到鄰近 patch（補償遮擋邊界效應）
+                                    injection_mask[0, patch_idx, 0] = occlusion_ratio
+                            
+                            # 平滑遮罩：使用鄰域平均，讓注入更自然
+                            if side >= 3:
+                                mask_2d = injection_mask.view(1, side, side, 1)
+                                kernel_size = 3
+                                padding = kernel_size // 2
+                                mask_2d_padded = F.pad(mask_2d.permute(0, 3, 1, 2), 
+                                                       (padding, padding, padding, padding), 
+                                                       mode='replicate')
+                                smoothed = F.avg_pool2d(mask_2d_padded, kernel_size, stride=1, padding=0)
+                                injection_mask = smoothed.permute(0, 2, 3, 1).reshape(1, num_patches, 1)
+                            
+                            # 🔥 大幅增強遮擋區域的注入強度（從 1.8 提高到 2.5）
+                            # 遮擋區域需要更強的記憶注入才能恢復
+                            injection_mask = torch.clamp(injection_mask * 2.5, max=1.0)
+                            
+                            # 🎯 對遮擋比例 > 50% 的 patch 再次加強
+                            high_occlusion = (injection_mask > 0.5).float()
+                            injection_mask = injection_mask + high_occlusion * 0.2
+                            injection_mask = torch.clamp(injection_mask, max=1.0)
+                        else:
+                            # Fallback: 使用中心遮罩（傳統方法）
                             idxs = torch.arange(num_patches, device=output.device).view(1, num_patches, 1)
                             rows = (idxs // side).float()
                             cols = (idxs % side).float()
                             center = (side - 1) / 2
                             dist = torch.maximum((rows - center).abs(), (cols - center).abs()) / (side / 2)
-                            center_mask = (dist < 0.8).float()
-                        else:
-                            center_mask = torch.ones((1, num_patches, 1), device=output.device)
+                            injection_mask = (dist < 0.8).float()
+                            injection_mask = torch.clamp(injection_mask * 1.5, max=1.0)
                     else:
-                        center_mask = torch.ones((1, num_patches, 1), device=output.device)
-                    center_mask = torch.clamp(center_mask * 1.5, max=1.0)
+                        injection_mask = torch.ones((1, num_patches, 1), device=output.device)
                     
                     # ============================================================
                     # 注入方法選擇 (和 occlusion_tester.py 相同)
                     # ============================================================
                     
                     if method == 'full':
-                        # 方法1: 全圖注入 (限制在中心遮罩)
-                        mix = strength * center_mask
+                        # 方法1: 全圖注入 (使用動態遮擋遮罩)
+                        mix = strength * injection_mask
                         if output.dim() == 3:
                             modified = output + mix * (projected_normalized - output)
                         else:
                             modified = output + mix.squeeze(0) * (projected_normalized - output)
                     
                     elif method == 'strong':
-                        # 方法2: 強力中心注入
+                        # 方法2: 強力遮擋區域注入
                         modified = output.clone()
                         if output.dim() == 3:
                             batch_size, num_patches, _ = output.shape
@@ -302,33 +476,39 @@ class CompleteDemoVisualizer:
                                 for row in range(side):
                                     for col in range(side):
                                         idx = row * side + col
-                                        dist_to_center = max(abs(row - side/2), abs(col - side/2)) / (side/2)
-                                        local_strength = strength * (1 - dist_to_center * 0.5)
-                                        local_strength = local_strength * center_mask[:, idx, :].squeeze(-1)
+                                        # 使用遮擋遮罩權重
+                                        local_strength = strength * injection_mask[:, idx, :].squeeze(-1)
                                         modified[:, idx] = (1 - local_strength) * output[:, idx] + local_strength * projected_normalized[:, idx]
                             else:
-                                mix = strength * center_mask
+                                mix = strength * injection_mask
                                 modified = output + mix * (projected_normalized - output)
                         else:
-                            mix = strength * center_mask
+                            mix = strength * injection_mask
                             modified = output + mix.squeeze(0) * (projected_normalized - output)
                     
                     elif method == 'adaptive':
-                        # 方法3: 自適應注入 - 根據特徵差異決定注入強度
+                        # 方法3: 自適應注入 - 結合特徵差異和遮擋遮罩
                         if output.dim() == 3:
                             diff = torch.abs(output - projected_normalized).mean(dim=-1, keepdim=True)
                             diff_normalized = diff / (diff.max() + 1e-6)
-                            adaptive_strength = strength * (0.5 + 0.5 * diff_normalized) * center_mask
+                            # 🔥 更激進的自適應策略：遮擋區域 + 高差異區域
+                            # 從 (0.5 + 0.5 * diff) 改為 (0.3 + 0.7 * diff)，讓差異影響更大
+                            adaptive_strength = strength * (0.3 + 0.7 * diff_normalized) * injection_mask
+                            # 在遮擋區域額外增強 20%
+                            occlusion_boost = injection_mask * 0.2
+                            adaptive_strength = torch.clamp(adaptive_strength + occlusion_boost, max=1.0)
                             modified = (1 - adaptive_strength) * output + adaptive_strength * projected_normalized
                         else:
                             diff = torch.abs(output - projected_normalized).mean(dim=-1, keepdim=True)
                             diff_normalized = diff / (diff.max() + 1e-6)
-                            adaptive_strength = strength * (0.5 + 0.5 * diff_normalized) * center_mask.squeeze(0)
+                            adaptive_strength = strength * (0.3 + 0.7 * diff_normalized) * injection_mask.squeeze(0)
+                            occlusion_boost = injection_mask.squeeze(0) * 0.2
+                            adaptive_strength = torch.clamp(adaptive_strength + occlusion_boost, max=1.0)
                             modified = (1 - adaptive_strength) * output + adaptive_strength * projected_normalized
                     
                     else:  # 'raw' 或其他
-                        # 方法4: 原始中心注入（保守）
-                        mix = strength * center_mask
+                        # 方法4: 原始遮擋區域注入（保守）
+                        mix = strength * injection_mask
                         if output.dim() == 3:
                             modified = output + mix * (projected_normalized - output)
                         else:
@@ -341,7 +521,7 @@ class CompleteDemoVisualizer:
             return injection_hook
         
         hook_handle = self.base_model.visual.register_forward_hook(
-            create_injection_hook(injection_method, injection_strength)
+            create_injection_hook(injection_method, injection_strength, occlusion_mask_tensor)
         )
         
         try:
@@ -1215,9 +1395,11 @@ class CompleteDemoVisualizer:
     # ========== 4. 遮擋測試視覺化 (NEW) ==========
     
     def visualize_occlusion_test(self, scene_dir, output_path, max_frames=40,
-                                  occlusion_start=15, occlusion_end=25,
+                                  occlusion_start=5, occlusion_gap=5,
                                   occlusion_ratio=0.4, occlusion_type='black',
-                                  injection_method='full'):
+                                  occlusion_frames=None,
+                                  injection_method='full', anomaly_threshold=0.25,
+                                  segment_length=3):
         """
         生成遮擋測試視覺化影片 - 介面風格仿照原版 visualization_demo.py
         
@@ -1225,11 +1407,13 @@ class CompleteDemoVisualizer:
             scene_dir: 場景目錄
             output_path: 輸出路徑
             max_frames: 最大幀數
-            occlusion_start: 遮擋開始幀
-            occlusion_end: 遮擋結束幀
-            occlusion_ratio: 遮擋區域比例
+            occlusion_start: 開始遮擋的幀數（預設第 5 幀）
+            occlusion_gap: 區間間隔（幀數），預設 5
+            occlusion_ratio: 遮擋區域比例（用於 YOLO 失敗時的備用遮擋）
             occlusion_type: 遮擋類型
             injection_method: 注入方法
+            anomaly_threshold: 異常檢測閾值 (預設 0.25)
+            segment_length: 每個遮擋區間長度（幀數），預設 3
         """
         print("\n🎬 生成遮擋測試視覺化...")
         
@@ -1243,7 +1427,21 @@ class CompleteDemoVisualizer:
         self.clear_temporal_buffer()
         
         # 初始化記憶緩衝區
-        memory_buffer = AdaptiveMemoryBuffer(max_size=8, anomaly_threshold=0.25)
+        memory_buffer = AdaptiveMemoryBuffer(max_size=8, anomaly_threshold=anomaly_threshold)
+
+        # 連續遮擋模式的結束幀（用於顯示與後備模式，避免未定義）
+        occlusion_end = min(len(frame_files), occlusion_start + segment_length)
+        
+        # 初始化 YOLO 遮擋器（如果需要）
+        yolo_occluder = None
+        if occlusion_type.startswith('yolo_') and YOLO_AVAILABLE:
+            print("📦 初始化 YOLO 物件偵測器...")
+            # 降低信心度閾值以偵測更多物件
+            yolo_occluder = YOLOOccluder(model_size='n', confidence_threshold=0.15)
+            print("✅ YOLO 已就緒 (confidence=0.15, 更敏感)")
+        elif occlusion_type.startswith('yolo_') and not YOLO_AVAILABLE:
+            print("⚠️ YOLO 不可用，改用 black 遮擋")
+            occlusion_type = 'black'
         
         frame_width = 1280
         frame_height = 720
@@ -1260,43 +1458,136 @@ class CompleteDemoVisualizer:
         total_injected = 0
         detection_history = []
         
+        # 解析遮擋幀列表 (如果有的話)
+        occlusion_frame_list = []
+        if occlusion_frames:
+            if isinstance(occlusion_frames, str):
+                occlusion_frame_list = [int(x.strip()) for x in occlusion_frames.split(',')]
+            elif isinstance(occlusion_frames, list):
+                occlusion_frame_list = occlusion_frames
+        else:
+            # 生成多個小區間的遮擋幀列表
+            # occlusion_start: 開始遮擋的幀數
+            # occlusion_gap: 區間間隔
+            
+            occlusion_frame_list = []
+            current_pos = occlusion_start  # 從指定幀開始
+            seg_count = 0
+            
+            # 持續生成區間直到影片結束
+            while current_pos + segment_length <= len(frame_files):
+                # 添加這個區間的所有幀
+                for offset in range(segment_length):
+                    occlusion_frame_list.append(current_pos + offset)
+                seg_count += 1
+                # 移動到下一個區間（區間長度 + 固定間隔）
+                current_pos += segment_length + occlusion_gap
+            
+            print(f"  🎯 生成 {seg_count} 個小區間遮擋 (從第 {occlusion_start} 幀開始):")
+            print(f"     - 每個區間長度: {segment_length} 幀")
+            print(f"     - 區間間隔: {occlusion_gap} 幀 (固定)")
+            print(f"     - 總遮擋幀數: {len(occlusion_frame_list)}")
+            print(f"     - 影片總幀數: {len(frame_files)}")
+            if len(occlusion_frame_list) <= 20:
+                print(f"     - 遮擋幀: {occlusion_frame_list}")
+        
         for i, frame_file in enumerate(tqdm(frame_files, desc="  處理幀")):
             original_img = Image.open(frame_file).convert('RGB')
             original_cv = cv2.cvtColor(np.array(original_img), cv2.COLOR_RGB2BGR)
             original_cv_clean = original_cv.copy()  # 保留原始圖像用於顯示
             
             # 是否加入遮擋
-            is_occluded = occlusion_start <= i < occlusion_end
+            if occlusion_frame_list:
+                is_occluded = i in occlusion_frame_list
+            else:
+                is_occluded = occlusion_start <= i < occlusion_end
             occluded_cv = original_cv.copy()
             
             if is_occluded:
                 total_occluded += 1
                 h, w = occluded_cv.shape[:2]
                 cx, cy = w // 2, h // 2
+                # 計算 70% 遮擋區域大小（用於 YOLO 失敗時）
+                fallback_size = int(min(w, h) * 0.70 / 2)  # 70% 的半徑
+                # 原始遮擋大小（用於其他傳統方式）
                 size = int(min(w, h) * occlusion_ratio / 2)
                 
-                if occlusion_type == 'black':
-                    cv2.rectangle(occluded_cv, (cx-size, cy-size), (cx+size, cy+size), (0, 0, 0), -1)
-                elif occlusion_type == 'white':
-                    cv2.rectangle(occluded_cv, (cx-size, cy-size), (cx+size, cy+size), (255, 255, 255), -1)
-                elif occlusion_type == 'blur':
-                    roi = occluded_cv[cy-size:cy+size, cx-size:cx+size]
-                    blurred = cv2.GaussianBlur(roi, (99, 99), 0)
-                    occluded_cv[cy-size:cy+size, cx-size:cx+size] = blurred
-                elif occlusion_type == 'noise':
-                    noise = np.random.randint(0, 255, (size*2, size*2, 3), dtype=np.uint8)
-                    occluded_cv[cy-size:cy+size, cx-size:cx+size] = noise
+                occluded_object_info = None  # 記錄被遮擋的物件資訊
+                
+                # ========== YOLO 物件遮擋 ==========
+                if occlusion_type.startswith('yolo_') and yolo_occluder:
+                    # 解析目標類別（None = 偵測所有物件）
+                    if occlusion_type == 'yolo_indoor':
+                        target_classes = ['chair', 'couch', 'dining table', 'bed', 'tv']
+                    elif occlusion_type == 'yolo_furniture':
+                        target_classes = ['chair', 'couch', 'dining table', 'bed']
+                    elif occlusion_type == 'yolo_chair':
+                        target_classes = ['chair']
+                    elif occlusion_type == 'yolo_all':
+                        target_classes = None  # 偵測所有物件
+                    else:
+                        target_classes = None  # 預設偵測所有物件
+                    
+                    # 對當前幀進行 YOLO 偵測並遮擋最多 3 個中等物件
+                    occluded_cv, selected_objects, all_detections = yolo_occluder.occlude_multiple_objects(
+                        occluded_cv,
+                        target_classes=target_classes,
+                        occlusion_color=(0, 0, 0),  # 黑色遮擋
+                        min_area=1000,               # 降低最小物件面積（原本 2000 太嚴格）
+                        max_objects=2,              # 最多遮擋 3 個物件
+                        size_preference='medium'    # 偏好中等大小的物件
+                    )
+                    
+                    if selected_objects:
+                        # 記錄被遮擋物件的資訊
+                        occluded_object_info = {
+                            'count': len(selected_objects),
+                            'objects': []
+                        }
+                        
+                        for obj in selected_objects:
+                            x1, y1, x2, y2 = obj['bbox']
+                            occluded_object_info['objects'].append({
+                                'class_name': obj['class_name'],
+                                'confidence': float(obj['confidence']),
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'area': int(obj['area']),
+                                'area_ratio': float(obj['area']) / (w * h)
+                            })
+                        
+                        # 在第一個遮擋幀時顯示資訊
+                        if i == occlusion_start or (occlusion_frame_list and i == min(occlusion_frame_list)):
+                            print(f"\n  🎯 YOLO 偵測到 {len(all_detections)} 個物件")
+                            print(f"  🚫 遮擋了 {len(selected_objects)} 個物件:")
+                            for obj in selected_objects:
+                                print(f"     - {obj['class_name']}: {obj['confidence']:.2f} "
+                                      f"(area: {obj['area']}, {obj['area']/(w*h)*100:.1f}%)")
+                    else:
+                        # 沒有偵測到適合的物件，使用 70% 中央黑色遮擋
+                        if i == occlusion_start or (occlusion_frame_list and i == min(occlusion_frame_list) if occlusion_frame_list else True):
+                            print(f"\n  ⚠️ 幀 {i}: YOLO 沒有偵測到符合條件的物件")
+                            if all_detections:
+                                print(f"     總共偵測到 {len(all_detections)} 個物件，但都太小 (< 2000 px)")
+                            print(f"     改用中央黑色遮擋 (70% 覆蓋)")
+                        cv2.rectangle(occluded_cv, (cx-fallback_size, cy-fallback_size), 
+                                    (cx+fallback_size, cy+fallback_size), (0, 0, 0), -1)
                 
                 input_img = Image.fromarray(cv2.cvtColor(occluded_cv, cv2.COLOR_BGR2RGB))
             else:
                 input_img = original_img
+                occluded_object_info = None
             
+            # 提取特徵
             # 提取特徵
             feat = self.extract_features(input_img)
             adapter_meta = getattr(self, 'last_adapter_meta', None)
             
+            # 提取邊緣特徵 (v6.1 Logic) - 用於場景匹配
+            # 必須對每一幀都提取，這樣記憶庫裡才會有
+            edge_feat_to_store = self.extract_edge_features(input_img)
+            
             # 加入記憶庫
-            result = memory_buffer.add_frame(feat, i, input_img, adapter_meta=adapter_meta)
+            result = memory_buffer.add_frame(feat, i, input_img, adapter_meta=adapter_meta, edge_feat=edge_feat_to_store)
             if len(result) == 5:
                 added, quality, anomaly_score, is_anomaly, debug_info = result
             else:
@@ -1318,8 +1609,14 @@ class CompleteDemoVisualizer:
             occluded_response = ""
             injected_response = ""
             
+            # 提取邊緣特徵 (v6.1 Logic)
+            if len(memory_buffer.features) > 0:
+                edge_feat = self.extract_edge_features(input_img)
+            else:
+                edge_feat = None
+
             if is_anomaly and len(memory_buffer.features) > 0:
-                best_memory, score, info = memory_buffer.get_best_memory(feat, i)
+                best_memory, score, info = memory_buffer.get_best_memory(feat, i, edge_feat=edge_feat)
                 
                 if best_memory is not None:
                     scene_match = info.get('scene_match', 1.0)
@@ -1336,24 +1633,54 @@ class CompleteDemoVisualizer:
                         memory_reliability=adapter_reliability
                     )
                     
-                    # 放寬注入強度上限（中心遮罩已降低風險）
+                    # 🔥 提高注入強度上限（動態遮擋遮罩讓注入更精確，可以更激進）
                     if injection_method == 'full':
-                        strength = min(0.35, base_strength * 0.8)
+                        strength = min(0.50, base_strength * 1.0)  # 從 0.35 提高到 0.50
+                    elif injection_method == 'adaptive':
+                        strength = min(0.55, base_strength * 1.1)  # adaptive 更高
                     else:
-                        strength = min(0.40, base_strength * 0.9)
+                        strength = min(0.45, base_strength * 0.95)
                     
-                    prompt = "Describe what you see in the center of this image."
+                    # 🎯 Prompt 策略優化：
+                    # 1. GT: 標準描述
+                    # 2. Occluded: 標準描述（測試純視覺 - 應該失敗）
+                    # 3. Injected: 強化記憶導向 prompt（明確提示遮擋和恢復）
+                    standard_prompt = "Describe what you see in this image."
+                    
+                    if is_occluded and occluded_object_info and 'objects' in occluded_object_info:
+                        # 有 YOLO 物件資訊：生成具體的引導 prompt
+                        occluded_classes = [obj['class_name'] for obj in occluded_object_info['objects']]
+                        occluded_classes_str = ', '.join(set(occluded_classes))
+                        
+                        memory_guided_prompt = (
+                            f"Some objects in this image are blocked by black occlusion masks. "
+                            f"Based on your visual memory and the context of the scene, describe what objects "
+                            f"are present in the blocked areas. Pay special attention to any {occluded_classes_str} "
+                            f"or similar objects that should be there. Describe the complete scene including the occluded parts."
+                        )
+                    elif is_occluded:
+                        # 無 YOLO 資訊：通用遮擋恢復 prompt
+                        memory_guided_prompt = (
+                            "Parts of this image are covered by black occlusion. "
+                            "Based on your visual memory from previous frames and the surrounding context, "
+                            "describe what objects or items are likely present in the occluded regions. "
+                            "Focus on completing the scene description even for blocked areas."
+                        )
+                    else:
+                        # 無遮擋：使用標準 prompt
+                        memory_guided_prompt = standard_prompt
                     
                     try:
-                        # GT 描述 (原圖)
-                        gt_response = self.generate_description(original_img, prompt)
+                        # GT 描述 (原圖 + 標準 prompt)
+                        gt_response = self.generate_description(original_img, standard_prompt)
                         
-                        # 遮擋圖描述 (無注入)
-                        occluded_response = self.generate_description(input_img, prompt)
+                        # 遮擋圖描述 (遮擋圖 + 標準 prompt，測試純視覺能力 - 應該看不到)
+                        occluded_response = self.generate_description(input_img, standard_prompt)
                         
-                        # 注入後描述
+                        # 注入後描述 (遮擋圖 + 記憶注入 + 強化記憶導向 prompt + 遮擋資訊)
                         injected_response = self.generate_with_injection(
-                            input_img, best_memory, prompt, strength, injection_method
+                            input_img, best_memory, memory_guided_prompt, strength, injection_method,
+                            occlusion_info=occluded_object_info  # 傳遞遮擋物件資訊
                         )
                         
                         injection_result = {
@@ -1374,6 +1701,7 @@ class CompleteDemoVisualizer:
                 'image_occlusion': img_occ,
                 'is_anomaly': is_anomaly,
                 'is_occluded': is_occluded,
+                'occluded_object': occluded_object_info,  # 新增：記錄被遮擋的物件
                 'injection': injection_result,
                 'gt_response': gt_response,
                 'occluded_response': occluded_response,
@@ -1398,6 +1726,25 @@ class CompleteDemoVisualizer:
             label_color = (0, 0, 255) if is_occluded else (200, 200, 200)
             cv2.putText(canvas, label, (360, 280),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 1)
+            
+            # 如果有 YOLO 遮擋物件資訊，顯示在圖像下方
+            if occluded_object_info:
+                if 'count' in occluded_object_info:
+                    # 多物件遮擋格式
+                    obj_names = [obj['class_name'] for obj in occluded_object_info['objects']]
+                    total_area_ratio = sum(obj['area_ratio'] for obj in occluded_object_info['objects'])
+                    if len(obj_names) == 1:
+                        obj_text = f"Occluded: {obj_names[0]} ({total_area_ratio*100:.1f}%)"
+                    else:
+                        obj_text = f"Occluded: {', '.join(obj_names[:2])}"
+                        if len(obj_names) > 2:
+                            obj_text += f", +{len(obj_names)-2}"
+                        obj_text += f" ({total_area_ratio*100:.1f}%)"
+                else:
+                    # 單物件遮擋格式（向後兼容）
+                    obj_text = f"Object: {occluded_object_info['class_name']} ({occluded_object_info['area_ratio']*100:.1f}%)"
+                cv2.putText(canvas, obj_text, (360, 300),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 165, 0), 1)
             
             # ========== 右側: 指標面板 (表格式) ==========
             panel_x = 700
@@ -1491,16 +1838,23 @@ class CompleteDemoVisualizer:
                 # 遮擋描述
                 cv2.putText(canvas, 'Occluded', (desc_col_x[0], desc_y + 105),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 1)
-                occ_short = occluded_response[:90] + '...' if len(occluded_response) > 90 else occluded_response
-                cv2.putText(canvas, occ_short, (desc_col_x[1], desc_y + 105),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                
+                # 簡單斷行 (每 90 字符)
+                occ_lines = [occluded_response[i:i+90] for i in range(0, len(occluded_response), 90)]
+                for k, line in enumerate(occ_lines[:2]): # 最多顯示2行
+                    cv2.putText(canvas, line + ('...' if k==1 and len(occ_lines)>2 else ''), 
+                               (desc_col_x[1], desc_y + 105 + k*20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                 
                 # 注入後描述
-                cv2.putText(canvas, f'Injected (s={injection_result["strength"]:.2f})', (desc_col_x[0], desc_y + 145),
+                cv2.putText(canvas, f'Injected (s={injection_result["strength"]:.2f})', (desc_col_x[0], desc_y + 155),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
-                inj_short = injected_response[:90] + '...' if len(injected_response) > 90 else injected_response
-                cv2.putText(canvas, inj_short, (desc_col_x[1], desc_y + 145),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                
+                inj_lines = [injected_response[i:i+90] for i in range(0, len(injected_response), 90)]
+                for k, line in enumerate(inj_lines[:2]):
+                    cv2.putText(canvas, line + ('...' if k==1 and len(inj_lines)>2 else ''), 
+                               (desc_col_x[1], desc_y + 155 + k*20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                 
                 # 注入資訊
                 cv2.putText(canvas, f'Memory from Frame {injection_result["memory_frame"]}, score={injection_result["memory_score"]:.2f}',
@@ -1519,7 +1873,7 @@ class CompleteDemoVisualizer:
             # ========== 檢測率曲線 (仿照原版準確率曲線) ==========
             if len(detection_history) > 1:
                 graph_x = 700
-                graph_y = desc_y + 80
+                graph_y = desc_y + 110 # 往下移一點避開多行文字
                 graph_w = 350
                 graph_h = 80
                 
@@ -1540,7 +1894,8 @@ class CompleteDemoVisualizer:
                 sampled = detection_history[::step]
                 
                 for j, rate in enumerate(sampled):
-                    x = graph_x + int(j * graph_w / max(len(sampled) - 1, 1))
+                    # FIX: 使用總幀數 len(frame_files) 作為分母，防止圖形擠壓
+                    x = graph_x + int(j * step * graph_w / max(len(frame_files) - 1, 1))
                     y = graph_y + graph_h - int(rate * graph_h)
                     points.append((x, y))
                 
@@ -1561,10 +1916,23 @@ class CompleteDemoVisualizer:
             cv2.rectangle(canvas, (20, progress_y), (20 + progress, progress_y + 20), (100, 200, 100), -1)
             
             # 遮擋區間標記
-            occ_start_x = int(20 + occlusion_start / len(frame_files) * progress_w)
-            occ_end_x = int(20 + occlusion_end / len(frame_files) * progress_w)
-            cv2.rectangle(canvas, (occ_start_x, progress_y - 5), (occ_end_x, progress_y + 25), (100, 100, 255), 2)
-            cv2.putText(canvas, 'Occlusion Zone', (occ_start_x, progress_y - 10),
+            if occlusion_frame_list:
+                # 閃爍模式：畫多個小標記
+                for occ_frame in occlusion_frame_list:
+                    occ_x = int(20 + occ_frame / len(frame_files) * progress_w)
+                    cv2.line(canvas, (occ_x, progress_y - 5), (occ_x, progress_y + 25), (100, 100, 255), 2)
+                
+                # 只在第一個標記處寫文字，避免重疊
+                if occlusion_frame_list:
+                    first_occ_x = int(20 + occlusion_frame_list[0] / len(frame_files) * progress_w)
+                    cv2.putText(canvas, 'Flicker', (first_occ_x, progress_y - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 255), 1)
+            else:
+                # 連續模式：畫一個大框
+                occ_start_x = int(20 + occlusion_start / len(frame_files) * progress_w)
+                occ_end_x = int(20 + occlusion_end / len(frame_files) * progress_w)
+                cv2.rectangle(canvas, (occ_start_x, progress_y - 5), (occ_end_x, progress_y + 25), (100, 100, 255), 2)
+                cv2.putText(canvas, 'Occlusion Zone', (occ_start_x, progress_y - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 255), 1)
             
             # ========== 底部標題 ==========
@@ -1573,7 +1941,10 @@ class CompleteDemoVisualizer:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
             
             # 配置說明
-            config_text = f'Occlusion: {occlusion_type}, {occlusion_ratio:.0%} area, frames {occlusion_start}-{occlusion_end}'
+            if occlusion_frame_list:
+                 config_text = f'Occlusion: {occlusion_type} (Flickering), {occlusion_ratio:.0%} area'
+            else:
+                 config_text = f'Occlusion: {occlusion_type}, {occlusion_ratio:.0%} area, frames {occlusion_start}-{occlusion_end}'
             cv2.putText(canvas, config_text, (600, frame_height - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
             
@@ -1594,8 +1965,9 @@ class CompleteDemoVisualizer:
             'detection_rate': len(detected) / max(len(occluded_frames), 1),
             'successful_injections': len(injected),
             'occlusion_config': {
-                'start': occlusion_start,
-                'end': occlusion_end,
+                'start': occlusion_start,  # 開始遮擋的幀數
+                'gap': occlusion_gap,  # 區間間隔
+                'segment_length': segment_length,
                 'ratio': occlusion_ratio,
                 'type': occlusion_type
             },
@@ -1607,8 +1979,10 @@ class CompleteDemoVisualizer:
     # ========== 完整 Demo 執行 ==========
     
     def run_complete_demo(self, data_root, output_dir, split='test', max_scenes=3,
-                          occlusion_start=15, occlusion_end=25, occlusion_ratio=0.4,
-                          occlusion_type='black', injection_method='full',
+                          occlusion_start=5, occlusion_gap=5, occlusion_ratio=0.4,
+                          occlusion_type='black', occlusion_frames=None, 
+                          injection_method='full', anomaly_threshold=0.25,
+                          segment_length=3,
                           demos=None):
         """
         執行完整 Demo
@@ -1616,6 +1990,9 @@ class CompleteDemoVisualizer:
         Args:
             demos: 要執行的 demo 列表，可選 ['temporal', 'depth', 'motion', 'occlusion']
                    如果為 None 則執行全部
+            occlusion_start: 開始遮擋的幀數，預設 5
+            occlusion_gap: 區間間隔（幀數），預設 5
+            segment_length: 每個遮擋區間長度，預設 3
         """
         if demos is None:
             demos = ['temporal', 'depth', 'motion', 'occlusion']
@@ -1669,6 +2046,8 @@ class CompleteDemoVisualizer:
             print(f"   - {scene_dir.name}: {frame_count} frames")
         
         all_stats = {}
+        # 連續遮擋模式的結束幀（摘要用；若使用 flicker 列表則會顯示 frames）
+        occlusion_end = occlusion_start + segment_length
         
         for scene_dir in scene_dirs:
             scene_name = scene_dir.name
@@ -1726,10 +2105,13 @@ class CompleteDemoVisualizer:
                         scene_dir,
                         scene_output_dir / 'occlusion_test.mp4',
                         occlusion_start=occlusion_start,
-                        occlusion_end=occlusion_end,
+                        occlusion_gap=occlusion_gap,
                         occlusion_ratio=occlusion_ratio,
                         occlusion_type=occlusion_type,
-                        injection_method=injection_method
+                        occlusion_frames=occlusion_frames,
+                        injection_method=injection_method,
+                        anomaly_threshold=anomaly_threshold,
+                        segment_length=segment_length
                     )
                     if stats:
                         # 保存詳細結果到 JSON
@@ -1774,21 +2156,23 @@ class CompleteDemoVisualizer:
         
         # 生成總結
         self._generate_summary(output_dir, scene_dirs, all_stats,
-                              occlusion_start, occlusion_end, occlusion_ratio, occlusion_type)
+                              occlusion_start, occlusion_end, occlusion_ratio, occlusion_type, occlusion_frames)
         
         print(f"\n🎉 所有視覺化完成！輸出目錄: {output_dir}")
     
     def _generate_summary(self, output_dir, scene_dirs, all_stats,
-                          occlusion_start, occlusion_end, occlusion_ratio, occlusion_type):
+                          occlusion_start, occlusion_end, occlusion_ratio, occlusion_type, occlusion_frames=None):
         """生成視覺化總結"""
         
         summary = {
             'timestamp': datetime.now().isoformat(),
+            'checkpoint': str(self.checkpoint_path),  # 記錄使用的 checkpoint
             'total_scenes': len(scene_dirs),
             'scenes': [d.name for d in scene_dirs],
             'occlusion_config': {
                 'start': occlusion_start,
                 'end': occlusion_end,
+                'frames': occlusion_frames,
                 'ratio': occlusion_ratio,
                 'type': occlusion_type
             },
@@ -1832,7 +2216,7 @@ class CompleteDemoVisualizer:
    - 俯視圖顯示 GT 軌跡
 
 4. **occlusion_test.mp4** - 遮擋測試 ⭐ NEW
-   - 遮擋配置: Frame {occlusion_start}-{occlusion_end}, ratio={occlusion_ratio}, type={occlusion_type}
+   - 遮擋配置: {f"Frames {occlusion_frames}" if occlusion_frames else f"Frame {occlusion_start}-{occlusion_end}"}, ratio={occlusion_ratio}, type={occlusion_type}
    - GT / 遮擋 / 注入後 描述對比
 
 5. **occlusion_results.json** - 遮擋測試詳細結果
@@ -1876,18 +2260,25 @@ def main():
                        help='要執行的 demo，用逗號分隔: temporal,depth,motion,occlusion 或 all')
     
     # 遮擋測試參數
-    parser.add_argument('--occlusion_start', type=int, default=15,
-                       help='遮擋開始幀')
-    parser.add_argument('--occlusion_end', type=int, default=25,
-                       help='遮擋結束幀')
+    parser.add_argument('--occlusion_start', type=int, default=5,
+                       help='開始遮擋的幀數，預設第 5 幀')
+    parser.add_argument('--occlusion_gap', type=int, default=5,
+                       help='遮擋區間間隔（幀數），預設 5 幀')
+    parser.add_argument('--occlusion_frames', type=str, default=None,
+                       help='指定遮擋幀 (用逗號分隔，例如 "5,8,12")')
     parser.add_argument('--occlusion_ratio', type=float, default=0.4,
-                       help='遮擋區域比例')
+                       help='遮擋區域比例（用於 YOLO 失敗時的備用遮擋）')
     parser.add_argument('--occlusion_type', type=str, default='black',
-                       choices=['black', 'white', 'blur', 'noise'],
-                       help='遮擋類型')
+                       choices=['black', 'white', 'blur', 'noise', 
+                               'yolo_indoor', 'yolo_furniture', 'yolo_chair', 'yolo_all'],
+                       help='遮擋類型 (yolo_* 需要安裝 ultralytics)')
     parser.add_argument('--injection_method', type=str, default='full',
-                       choices=['raw', 'full', 'strong', 'adaptive'],
-                       help='注入方法')
+                       choices=['raw', 'full', 'strong', 'adaptive', 'none'],
+                       help='注入方法 (none=不注入，用於對比實驗)')
+    parser.add_argument('--anomaly_threshold', type=float, default=0.25,
+                       help='異常檢測閾值 (越低越敏感)')
+    parser.add_argument('--segment_length', type=int, default=3,
+                       help='每個遮擋區間的長度（幀數），預設 3 幀')
     
     args = parser.parse_args()
     
@@ -1908,10 +2299,13 @@ def main():
         split=args.split,
         max_scenes=args.max_scenes,
         occlusion_start=args.occlusion_start,
-        occlusion_end=args.occlusion_end,
+        occlusion_gap=args.occlusion_gap,
+        occlusion_frames=args.occlusion_frames,
         occlusion_ratio=args.occlusion_ratio,
         occlusion_type=args.occlusion_type,
         injection_method=args.injection_method,
+        anomaly_threshold=args.anomaly_threshold,
+        segment_length=args.segment_length,
         demos=demos
     )
 
